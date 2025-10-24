@@ -1,161 +1,149 @@
-# build_all_marts_v2.py  # Efficient build: streaming + DuckDB + orjson (fallback)
-# Install once: pip install pandas pyarrow duckdb orjson  # orjson optional (falls back to json)
+# build_all_marts_v2.py  # Efficient build: streaming JSON → Parquet with PyArrow, heavy transforms in DuckDB, fast orjson parsing (fallback to json)
+# Install once: pip install pandas pyarrow duckdb orjson  # Required packages; orjson is optional (we fallback automatically)
 
-import os, gc  # OS helpers and GC for occasional cleanup
-from pathlib import Path  # Path-safe filesystem ops
-from typing import Dict, Tuple  # Type hints
-import pandas as pd  # Light previews + dim_security write
-import pyarrow as pa  # Arrow tables
-import pyarrow.parquet as pq  # Parquet writer
-import duckdb  # Fast SQL over Parquet
+import os, gc  # os for directory scanning and paths; gc to nudge garbage collection after chunk flushes
+from pathlib import Path  # Path provides OS-agnostic path joins and checks
+from typing import Dict, Tuple  # Type hints for readability and tooling
+import pandas as pd  # Used for light tasks (dim_security creation, quick previews)
+import pyarrow as pa  # Arrow table memory format used for efficient columnar data
+import pyarrow.parquet as pq  # Parquet read/write API built on Arrow
+import duckdb  # Embedded analytical SQL database that queries Parquet directly, with spill-to-disk
 
-try: import orjson as _json  # Fast JSON (Rust); returns Python objects
-except Exception: import json as _json  # Fallback to stdlib json
+try: import orjson as _json  # Try to import orjson for fastest JSON parsing
+except Exception: import json as _json  # If orjson unavailable, fall back to Python stdlib json
 
-BASE = Path(r"C:\smilefund_project")  # Project root
-FACTS = BASE / r"data\sec\company_facts"  # SEC company_facts JSON folder
-DATA = BASE / r"data\sec"  # Misc SEC data (ticker_map.csv)
-WARE = BASE / r"warehouse\parquet"  # Warehouse root
-MARTS = WARE / "marts_v2"  # Output mart folder
-LOGS = MARTS / "_logs"  # Logs folder (reserved)
-TMP_DUCKDB = MARTS / "_duckdb_tmp"  # DuckDB spill dir
+BASE = Path(r"C:\smilefund_project")  # Project root directory (edit if your project lives elsewhere)
+FACTS = BASE / r"data\sec\company_facts"  # Directory containing SEC company_facts JSON files
+DATA = BASE / r"data\sec"  # Directory for auxiliary SEC data (e.g., ticker_map.csv)
+WARE = BASE / r"warehouse\parquet"  # Warehouse root path for Parquet outputs
+MARTS = WARE / "marts_v2"  # Versioned marts output directory
+LOGS = MARTS / "_logs"  # Subfolder for future logs or debug artifacts
+TMP_DUCKDB = MARTS / "_duckdb_tmp"  # Temporary folder where DuckDB can spill to disk
 
-MARTS.mkdir(parents=True, exist_ok=True)  # Ensure output dirs
-LOGS.mkdir(parents=True, exist_ok=True)
-TMP_DUCKDB.mkdir(parents=True, exist_ok=True)
+MARTS.mkdir(parents=True, exist_ok=True)  # Ensure the marts output folder exists
+LOGS.mkdir(parents=True, exist_ok=True)  # Ensure the logs folder exists (not strictly used yet)
+TMP_DUCKDB.mkdir(parents=True, exist_ok=True)  # Ensure DuckDB temp directory exists for safe spill
 
-USD_UNITS_MULT: Dict[str,int] = {"USD":1,"USD$":1,"USDthousands":1_000,"USDThousands":1_000,"USDm":1_000_000,"USDmillions":1_000_000,"USDMillions":1_000_000}  # Unit multipliers
-Q_MIN, Q_MAX = 70, 110  # Valid 10-Q duration days
-FY_MIN, FY_MAX = 330, 380  # Valid 10-K duration days
+USD_UNITS_MULT: Dict[str,int] = {"USD":1,"USD$":1,"USDthousands":1_000,"USDThousands":1_000,"USDm":1_000_000,"USDmillions":1_000_000,"USDMillions":1_000_000}  # Map SEC unit strings to numeric multipliers
+Q_MIN, Q_MAX = 70, 110  # Acceptable day range for quarterly duration periods (roughly one quarter)
+FY_MIN, FY_MAX = 330, 380  # Acceptable day range for fiscal-year duration periods (roughly one year)
 
-def parse_dt(s): return pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")  # Parse YYYY-MM-DD → Timestamp/NaT
-def duration_days(start, end):  # Inclusive day count
-    s, e = parse_dt(start), parse_dt(end)
-    if pd.isna(s) or pd.isna(e): return None
-    return int((e - s).days) + 1
-def is_duration(rec: dict) -> bool: return rec.get("start") is not None  # Duration has 'start'
-def load_company_file(path: Path) -> Tuple[int, dict]:  # Parse company_facts JSON
-    try: d = _json.loads(path.read_bytes())  # orjson fast path (bytes)
-    except Exception: d = _json.loads(path.read_text(encoding="utf-8"))  # Fallback to text
-    return int(d.get("cik", 0)), d  # Return cik and dict
+def parse_dt(s): return pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")  # Parse 'YYYY-MM-DD' into Timestamp or NaT if invalid
+def duration_days(start, end):  # Compute inclusive number of days between two dates; None if any side invalid
+    s, e = parse_dt(start), parse_dt(end)  # Convert raw strings to timestamps
+    if pd.isna(s) or pd.isna(e): return None  # If either date missing/invalid, return None
+    return int((e - s).days) + 1  # Inclusive day count (add 1 so start=end yields 1 day)
+def is_duration(rec: dict) -> bool: return rec.get("start") is not None  # Duration records include 'start'; instant records do not
+def load_company_file(path: Path) -> Tuple[int, dict]:  # Read one company_facts JSON and return its (cik, payload dict)
+    try: d = _json.loads(path.read_bytes())  # Fast path: parse bytes via orjson (or stdlib if orjson was aliased to _json)
+    except Exception: d = _json.loads(path.read_text(encoding="utf-8"))  # Fallback path: parse decoded text
+    return int(d.get("cik", 0)), d  # Return integer CIK (default 0 if missing) and the parsed dict
 
-def iter_all_us_gaap_usd(cik: int, data: dict):  # Stream normalized USD us-gaap rows
-    facts = data.get("facts", {}).get("us-gaap", {})  # Dive to us-gaap
-    mul = USD_UNITS_MULT  # Local ref (micro-optimization)
-    for tag, blk in facts.items():
-        units = blk.get("units", {})
-        for unit, arr in units.items():
-            m = mul.get(unit)
-            if not m: continue
-            for rec in arr:
-                fp, form, fy, val = rec.get("fp"), rec.get("form"), rec.get("fy"), rec.get("val")
-                if val is None or fy is None or fp is None or form is None: continue
-                pt = "duration" if rec.get("start") else "instant"
-                if pt == "duration":
-                    d = duration_days(rec.get("start"), rec.get("end"))
-                    if fp in ("Q1","Q2","Q3"):
-                        if not (form and form.startswith("10-Q") and d and Q_MIN<=d<=Q_MAX): continue
-                    elif fp == "FY":
-                        if not (form and form.startswith("10-K") and d and FY_MIN<=d<=FY_MAX): continue
-                    elif fp == "Q4": continue  # derive via 10-K delta
-                else:
-                    if fp not in ("Q1","Q2","Q3","Q4","FY"): continue
-                try: value = float(val) * m
-                except Exception: continue
-                yield {"cik":cik,"tag":tag,"unit":unit,"fy":int(fy),"fp":str(fp),"form":str(form),
-                       "filed":rec.get("filed") or None,"start":rec.get("start"),"end":rec.get("end"),
-                       "period_type":pt,"value":value}
+def iter_all_us_gaap_usd(cik: int, data: dict):  # Generator yielding normalized USD us-gaap rows for a single company
+    facts = data.get("facts", {}).get("us-gaap", {})  # Navigate to us-gaap facts safely (default empty dicts)
+    mul = USD_UNITS_MULT  # Local reference to unit multipliers (slight speedup)
+    for tag, blk in facts.items():  # Iterate each XBRL tag (e.g., Revenues, Assets)
+        units = blk.get("units", {})  # For each tag, get the units mapping (e.g., {"USD": [...], "USDm": [...]})
+        for unit, arr in units.items():  # Iterate each unit bucket and its list of fact records
+            m = mul.get(unit)  # Look up numeric multiplier (None if not a USD variant we handle)
+            if not m: continue  # Skip non-USD units entirely
+            for rec in arr:  # Iterate each SEC fact record under this (tag, unit)
+                fp, form, fy, val = rec.get("fp"), rec.get("form"), rec.get("fy"), rec.get("val")  # Extract period, form, fiscal year, and value
+                if val is None or fy is None or fp is None or form is None: continue  # Skip incomplete rows early
+                pt = "duration" if rec.get("start") else "instant"  # Determine period type based on presence of 'start'
+                if pt == "duration":  # Additional checks for duration records
+                    d = duration_days(rec.get("start"), rec.get("end"))  # Compute day length for validation filters
+                    if fp in ("Q1","Q2","Q3"):  # Quarter durations should be from 10-Q and near a quarter in length
+                        if not (form and form.startswith("10-Q") and d and Q_MIN<=d<=Q_MAX): continue  # Enforce 10-Q and day-window
+                    elif fp == "FY":  # Fiscal-year durations should be from 10-K and near a year in length
+                        if not (form and form.startswith("10-K") and d and FY_MIN<=d<=FY_MAX): continue  # Enforce 10-K and day-window
+                    elif fp == "Q4": continue  # Ignore duration Q4 (we compute Q4 via 10-K delta instead)
+                else:  # Instant records (balance-sheet style)
+                    if fp not in ("Q1","Q2","Q3","Q4","FY"): continue  # Keep only recognized period endpoints
+                try: value = float(val) * m  # Convert reported value to float and scale to USD units
+                except Exception: continue  # Skip rows with non-numeric values
+                yield {"cik":cik,"tag":tag,"unit":unit,"fy":int(fy),"fp":str(fp),"form":str(form),"filed":rec.get("filed") or None,"start":rec.get("start"),"end":rec.get("end"),"period_type":pt,"value":value}  # Emit a normalized row
 
-def build_dim_security(FACTS: Path, DATA: Path, out_path: Path) -> pd.DataFrame:  # Light Python step
-    rows = []
-    it = os.scandir(FACTS)  # Faster directory walk than glob for many files
-    i = 0
-    for de in it:
-        if not de.is_file() or not de.name.endswith(".json"): continue
-        i += 1
-        try:
-            d = _json.loads(Path(de.path).read_bytes())
-            cik = int(d.get("cik", 0))
-            name = d.get("entityName") or ""
-            ticker = d.get("ticker") or d.get("tickers")
-            if isinstance(ticker, list) and ticker: ticker = str(ticker[0])
-            rows.append({"cik":cik,"company_name":name,"ticker":ticker})
-        except Exception: pass
-        if i % 2000 == 0: print(f"dim_security progress {i}+")
-    dim = pd.DataFrame(rows).drop_duplicates("cik")
-    dim["cik"] = pd.to_numeric(dim["cik"], errors="coerce").astype("Int64")
-    dim["ticker"] = dim["ticker"].astype(str).str.upper().str.strip()
-    dim.loc[dim["ticker"].isin(["NONE","NAN","<NA>",""]), "ticker"] = pd.NA
-    dim["company_name"] = (dim["company_name"].astype(str)
-                           .str.replace(r"[^A-Za-z0-9 &\.-]+"," ",regex=True)
-                           .str.replace(r"\s+"," ",regex=True)
-                           .str.strip())
-    map_csv = DATA / "ticker_map.csv"
-    if map_csv.exists():
-        tm = pd.read_csv(map_csv)
-        tm.columns = [c.strip().lower() for c in tm.columns]
-        if "cik" in tm.columns and "ticker" in tm.columns:
-            tm["cik"] = pd.to_numeric(tm["cik"], errors="coerce").astype("Int64")
-            tm["ticker"] = tm["ticker"].astype(str).str.upper().str.strip().replace("-", ".", regex=False)
-            tm = tm.dropna(subset=["cik"]).drop_duplicates("cik", keep="first")
-            dim = dim.merge(tm[["cik","ticker"]], on="cik", how="left", suffixes=("","_map"))
-            dim["ticker"] = dim["ticker_map"].combine_first(dim["ticker"])
-            dim.drop(columns=["ticker_map"], inplace=True, errors="ignore")
-            print(f"✅ merged ticker_map.csv with {len(tm):,} rows")
-        else: print("⚠️ ticker_map.csv missing 'cik' or 'ticker' — skipped merge")
-    else: print("ℹ️ ticker_map.csv not found — dim_security uses embedded tickers only")
-    dim.to_parquet(out_path)
-    return dim
+def build_dim_security(FACTS: Path, DATA: Path, out_path: Path) -> pd.DataFrame:  # Build company dimension table and write to Parquet
+    rows = []  # Collect one row per company (CIK, company_name, ticker)
+    it = os.scandir(FACTS)  # Scan directory entries (faster and lighter than glob for many files)
+    i = 0  # Counter for progress messages
+    for de in it:  # Iterate directory entries
+        if not de.is_file() or not de.name.endswith(".json"): continue  # Skip non-files and non-JSONs
+        i += 1  # Increment processed-file counter
+        try:  # Try to parse the JSON file
+            d = _json.loads(Path(de.path).read_bytes())  # Parse bytes via orjson/json
+            cik = int(d.get("cik", 0))  # Extract CIK (0 if missing)
+            name = d.get("entityName") or ""  # Extract entity name (blank if missing)
+            ticker = d.get("ticker") or d.get("tickers")  # Extract single ticker or list of tickers
+            if isinstance(ticker, list) and ticker: ticker = str(ticker[0])  # Normalize to a single ticker if list provided
+            rows.append({"cik":cik,"company_name":name,"ticker":ticker})  # Append normalized company row
+        except Exception: pass  # Swallow parsing errors (occasionally malformed vendor files)
+        if i % 2000 == 0: print(f"dim_security progress {i}+")  # Heartbeat every ~2000 companies processed
+    dim = pd.DataFrame(rows).drop_duplicates("cik")  # Create DataFrame and ensure one row per CIK
+    dim["cik"] = pd.to_numeric(dim["cik"], errors="coerce").astype("Int64")  # Normalize CIK to nullable Int64 dtype
+    dim["ticker"] = dim["ticker"].astype(str).str.upper().str.strip()  # Uppercase and trim whitespace from tickers
+    dim.loc[dim["ticker"].isin(["NONE","NAN","<NA>",""]), "ticker"] = pd.NA  # Normalize invalid/blank markers to NA
+    dim["company_name"] = (dim["company_name"].astype(str).str.replace(r"[^A-Za-z0-9 &\.-]+"," ",regex=True).str.replace(r"\s+"," ",regex=True).str.strip())  # Clean company names (printable chars, single spaces)
+    map_csv = DATA / "ticker_map.csv"  # Optional user-provided CIK→ticker override map
+    if map_csv.exists():  # If an override map is present
+        tm = pd.read_csv(map_csv)  # Read the override CSV into DataFrame
+        tm.columns = [c.strip().lower() for c in tm.columns]  # Normalize column names to lowercase
+        if "cik" in tm.columns and "ticker" in tm.columns:  # Validate required columns
+            tm["cik"] = pd.to_numeric(tm["cik"], errors="coerce").astype("Int64")  # Normalize override CIK dtype
+            tm["ticker"] = tm["ticker"].astype(str).str.upper().str.strip().replace("-", ".", regex=False)  # Normalize and map '-'→'.'
+            tm = tm.dropna(subset=["cik"]).drop_duplicates("cik", keep="first")  # One override per CIK
+            dim = dim.merge(tm[["cik","ticker"]], on="cik", how="left", suffixes=("","_map"))  # Merge override ticker column
+            dim["ticker"] = dim["ticker_map"].combine_first(dim["ticker"])  # Prefer mapped ticker when available
+            dim.drop(columns=["ticker_map"], inplace=True, errors="ignore")  # Drop temporary merge column
+            print(f"✅ merged ticker_map.csv with {len(tm):,} rows")  # Print merge confirmation with row count
+        else: print("⚠️ ticker_map.csv missing 'cik' or 'ticker' — skipped merge")  # Warn if schema is not as expected
+    else: print("ℹ️ ticker_map.csv not found — dim_security uses embedded tickers only")  # Inform that only embedded tickers are used
+    dim.to_parquet(out_path)  # Write dimension table to Parquet
+    return dim  # Return DataFrame for potential in-memory use (e.g., row count log)
 
-def main():  # Orchestrate streaming + DuckDB pipeline
-    raw_parquet_path = MARTS / "_raw_us_gaap_usd.parquet"  # Streamed raw rows
-    best_parquet_path = MARTS / "_best.parquet"  # De-duped rows
-    for p in (raw_parquet_path, best_parquet_path):
-        if p.exists(): p.unlink()  # Fresh intermediates
-
-    arrow_schema = pa.schema([("cik",pa.int64()),("tag",pa.string()),("unit",pa.string()),("fy",pa.int32()),
-                              ("fp",pa.string()),("form",pa.string()),("filed",pa.string()),
-                              ("start",pa.string()),("end",pa.string()),("period_type",pa.string()),("value",pa.float64())])  # Fixed schema
-    BUFFER_TARGET_ROWS = 15_000  # Lower buffer -> lower peak RAM (tune up/down)
-    buffer = []  # Accumulating rows before flush
-    writer = None  # ParquetWriter handle
-
-    count = 0  # Files processed
-    for de in os.scandir(FACTS):  # Stream directory entries
-        if not de.is_file() or not de.name.endswith(".json"): continue
-        count += 1
-        try:
-            cik, data = load_company_file(Path(de.path))  # Parse JSON
-            for row in iter_all_us_gaap_usd(cik, data): buffer.append(row)  # Append normalized rows
-            if len(buffer) >= BUFFER_TARGET_ROWS:  # Flush chunk
-                tbl = pa.Table.from_pylist(buffer, schema=arrow_schema)
-                if writer is None: writer = pq.ParquetWriter(raw_parquet_path, arrow_schema, compression="zstd")
-                writer.write_table(tbl)
-                buffer.clear()
-                del tbl
-                gc.collect()
-        except Exception: pass  # Skip bad file and continue
-        if count % 2000 == 0: print(f"parsed {count} companies")
-
-    if buffer:  # Final flush
-        tbl = pa.Table.from_pylist(buffer, schema=arrow_schema)
-        if writer is None: writer = pq.ParquetWriter(raw_parquet_path, arrow_schema, compression="zstd")
-        writer.write_table(tbl)
-        buffer.clear()
-        del tbl
-    if writer is not None: writer.close()  # Close writer
-    if not raw_parquet_path.exists(): raise RuntimeError("No USD us-gaap facts parsed (raw parquet not created).")
-    print(f"✅ wrote {raw_parquet_path}")
-
-    with duckdb.connect() as con:  # DuckDB session (auto-close)
-        con.execute("PRAGMA threads=auto;")  # Use all cores
-        con.execute(f"PRAGMA temp_directory='{str(TMP_DUCKDB).replace(\"'\",\"''\")}';")  # Spill to disk if needed
-        con.execute("PRAGMA memory_limit='85%';")  # Allow DuckDB to use most memory but not all
-        con.execute("CREATE OR REPLACE TEMP VIEW raw AS SELECT * FROM read_parquet(?);", [str(raw_parquet_path)])  # View: raw
-
+def main():  # Entry point orchestrating streaming ingestion and DuckDB transformations
+    raw_parquet_path = MARTS / "_raw_us_gaap_usd.parquet"  # Path for streamed raw us-gaap rows
+    best_parquet_path = MARTS / "_best.parquet"  # Path for de-duplicated best-per-period rows
+    for p in (raw_parquet_path, best_parquet_path):  # Loop over intermediate files
+        if p.exists(): p.unlink()  # Remove existing intermediates to ensure a clean build
+    arrow_schema = pa.schema([("cik",pa.int64()),("tag",pa.string()),("unit",pa.string()),("fy",pa.int32()),("fp",pa.string()),("form",pa.string()),("filed",pa.string()),("start",pa.string()),("end",pa.string()),("period_type",pa.string()),("value",pa.float64())])  # Fixed Arrow schema for streamed rows
+    BUFFER_TARGET_ROWS = 15_000  # Row threshold to flush a chunk to Parquet (lower uses less RAM, higher is faster)
+    buffer = []  # In-memory buffer collecting normalized rows
+    writer = None  # ParquetWriter handle; created lazily on first flush
+    count = 0  # Files processed counter for progress output
+    for de in os.scandir(FACTS):  # Iterate directory entries for maximum speed on large folders
+        if not de.is_file() or not de.name.endswith(".json"): continue  # Skip non-file entries and non-JSON files
+        count += 1  # Increment processed-file counter
+        try:  # Protect parse so a single bad JSON doesn’t stop the run
+            cik, data = load_company_file(Path(de.path))  # Parse current company_facts file
+            for row in iter_all_us_gaap_usd(cik, data): buffer.append(row)  # Extend buffer with normalized USD rows
+            if len(buffer) >= BUFFER_TARGET_ROWS:  # If buffer reached threshold, flush to Parquet
+                tbl = pa.Table.from_pylist(buffer, schema=arrow_schema)  # Convert list-of-dicts to Arrow table
+                if writer is None: writer = pq.ParquetWriter(raw_parquet_path, arrow_schema, compression="zstd")  # Open writer on first flush
+                writer.write_table(tbl)  # Append the chunk to the Parquet file
+                buffer.clear()  # Clear Python list to free memory
+                del tbl  # Drop Arrow table reference to reduce memory pressure
+                gc.collect()  # Hint Python to reclaim memory promptly
+        except Exception: pass  # On any file error, skip and continue
+        if count % 2000 == 0: print(f"parsed {count} companies")  # Progress heartbeat every ~2000 files
+    if buffer:  # After loop, flush any remaining rows in buffer
+        tbl = pa.Table.from_pylist(buffer, schema=arrow_schema)  # Convert final buffered rows
+        if writer is None: writer = pq.ParquetWriter(raw_parquet_path, arrow_schema, compression="zstd")  # Open writer if never opened
+        writer.write_table(tbl)  # Write last chunk
+        buffer.clear()  # Clear buffer
+        del tbl  # Drop table object
+    if writer is not None: writer.close()  # Close Parquet writer to finalize file
+    if not raw_parquet_path.exists(): raise RuntimeError("No USD us-gaap facts parsed (raw parquet not created).")  # Sanity check for ingestion
+    print(f"✅ wrote {raw_parquet_path}")  # Log the raw parquet output location
+    with duckdb.connect() as con:  # Open a DuckDB connection that auto-closes via context manager
+        con.execute("PRAGMA threads=auto;")  # Use all CPU threads available
+        con.execute(f"PRAGMA temp_directory='{str(TMP_DUCKDB).replace(\"'\",\"''\")}';")  # Set spill directory for large intermediate operations
+        con.execute("PRAGMA memory_limit='85%';")  # Cap DuckDB memory usage to avoid OS thrashing
+        con.execute("CREATE OR REPLACE TEMP VIEW raw AS SELECT * FROM read_parquet(?);", [str(raw_parquet_path)])  # Register raw parquet as a temp view
         con.execute("""CREATE OR REPLACE TABLE best AS
                        WITH ranked AS (
-                         SELECT *, 
+                         SELECT *,
                            CASE
                              WHEN period_type='duration' AND fp IN ('Q1','Q2','Q3') THEN CASE WHEN form LIKE '10-Q%%' THEN 0 ELSE 1 END
                              WHEN period_type='duration' AND fp='FY' THEN CASE WHEN form LIKE '10-K%%' THEN 0 ELSE 1 END
@@ -167,25 +155,23 @@ def main():  # Orchestrate streaming + DuckDB pipeline
                          FROM raw
                        ),
                        dedup AS (
-                         SELECT *, ROW_NUMBER() OVER (
-                           PARTITION BY cik, tag, fy, fp, period_type
-                           ORDER BY form_rank ASC, filed_dt ASC
-                         ) AS rn
+                         SELECT *,
+                                ROW_NUMBER() OVER (
+                                  PARTITION BY cik, tag, fy, fp, period_type
+                                  ORDER BY form_rank ASC, filed_dt ASC
+                                ) AS rn
                          FROM ranked
                        )
-                       SELECT * FROM dedup WHERE rn=1;""")  # Rank + dedupe
-        con.execute("COPY best TO ? (FORMAT PARQUET, COMPRESSION ZSTD);", [str(best_parquet_path)])
-        print(f"✅ wrote {best_parquet_path}")
-
-        fact_quarters_true_path = MARTS / "fact_quarters_true.parquet"  # Output paths
-        fact_ttm_aligned_path = MARTS / "fact_ttm_aligned.parquet"
-        dim_fye_path = MARTS / "dim_fiscal_year_end.parquet"
-        latest_ttm_path = MARTS / "vw_latest_ttm.parquet"
-        for p in (fact_quarters_true_path, fact_ttm_aligned_path, dim_fye_path, latest_ttm_path):
-            if p.exists(): p.unlink()  # Clean old outputs
-
-        con.execute("CREATE OR REPLACE VIEW best AS SELECT * FROM read_parquet(?);", [str(best_parquet_path)])  # View: best
-
+                       SELECT * FROM dedup WHERE rn=1;""")  # Rank filings by preferred form + earliest filed and keep the top per (cik,tag,fy,fp,period_type)
+        con.execute("COPY best TO ? (FORMAT PARQUET, COMPRESSION ZSTD);", [str(best_parquet_path)])  # Persist the deduplicated 'best' table to Parquet
+        print(f"✅ wrote {best_parquet_path}")  # Log the best parquet output
+        fact_quarters_true_path = MARTS / "fact_quarters_true.parquet"  # Output path: consolidated true quarters
+        fact_ttm_aligned_path = MARTS / "fact_ttm_aligned.parquet"  # Output path: TTM values aligned to calendar
+        dim_fye_path = MARTS / "dim_fiscal_year_end.parquet"  # Output path: inferred fiscal year-end months
+        latest_ttm_path = MARTS / "vw_latest_ttm.parquet"  # Output path: latest TTM snapshot per (cik, tag)
+        for p in (fact_quarters_true_path, fact_ttm_aligned_path, dim_fye_path, latest_ttm_path):  # Iterate outputs to avoid stale files
+            if p.exists(): p.unlink()  # Remove previous outputs for a clean slate
+        con.execute("CREATE OR REPLACE VIEW best AS SELECT * FROM read_parquet(?);", [str(best_parquet_path)])  # Re-register best parquet as a view
         con.execute("""CREATE OR REPLACE TABLE quarters_true AS
                        WITH dur_q AS (
                          SELECT cik, tag, fy, fp,
@@ -232,10 +218,9 @@ def main():  # Orchestrate streaming + DuckDB pipeline
                        SELECT * FROM dur_q
                        UNION ALL SELECT * FROM dur_q4_delta
                        UNION ALL SELECT * FROM ins_q
-                       UNION ALL SELECT * FROM ins_fy_to_q4;""")  # Build true quarters
-        con.execute("COPY quarters_true TO ? (FORMAT PARQUET, COMPRESSION ZSTD);", [str(fact_quarters_true_path)])
-        print(f"✅ wrote {fact_quarters_true_path}")
-
+                       UNION ALL SELECT * FROM ins_fy_to_q4;""")  # Build true quarters table (duration Q1-3 + 10-K delta Q4, instant quarters with FY→Q4 backfill)
+        con.execute("COPY quarters_true TO ? (FORMAT PARQUET, COMPRESSION ZSTD);", [str(fact_quarters_true_path)])  # Write quarters_true Parquet
+        print(f"✅ wrote {fact_quarters_true_path}")  # Log quarters output
         con.execute("""CREATE OR REPLACE TABLE ttm AS
                        WITH base AS (SELECT cik, tag, fy, fp, qn, value, period_type FROM quarters_true),
                        w AS (
@@ -250,8 +235,7 @@ def main():  # Orchestrate streaming + DuckDB pipeline
                        )
                        SELECT cik, tag, fy, fp, qn, value, period_type, TTM_value
                        FROM w
-                       WHERE (period_type='instant' OR cnt4=4) AND TTM_value IS NOT NULL;""")  # TTM with rolling 4Q
-
+                       WHERE (period_type='instant' OR cnt4=4) AND TTM_value IS NOT NULL;""")  # Compute TTM: rolling 4Q for duration, identity for instant; keep only full windows
         con.execute("""CREATE OR REPLACE TABLE dim_fiscal_year_end AS
                        WITH fy AS (
                          SELECT cik, TRY_CAST(end AS DATE) AS end_dt
@@ -270,10 +254,9 @@ def main():  # Orchestrate streaming + DuckDB pipeline
                        )
                        SELECT cik, fye_month, ((fye_month % 12)+1)::INT AS fiscal_year_start_month
                        FROM ranked
-                       WHERE rn=1;""")  # Infer FYE month by mode
-        con.execute("COPY dim_fiscal_year_end TO ? (FORMAT PARQUET, COMPRESSION ZSTD);", [str(dim_fye_path)])
-        print(f"✅ wrote {dim_fye_path}")
-
+                       WHERE rn=1;""")  # Infer each CIK’s fiscal year-end month by most frequent FY end month
+        con.execute("COPY dim_fiscal_year_end TO ? (FORMAT PARQUET, COMPRESSION ZSTD);", [str(dim_fye_path)])  # Write FYE dimension Parquet
+        print(f"✅ wrote {dim_fye_path}")  # Log FYE dimension output
         con.execute("""CREATE OR REPLACE TABLE ttm_aligned AS
                        WITH a AS (SELECT t.*, d.fye_month FROM ttm t LEFT JOIN dim_fiscal_year_end d USING(cik)),
                        aln AS (
@@ -285,18 +268,16 @@ def main():  # Orchestrate streaming + DuckDB pipeline
                        SELECT *,
                               ((quarter_end_month - 1)/3 + 1)::INT AS calendar_quarter,
                               CASE WHEN quarter_end_month <= fye_month THEN fy ELSE fy - 1 END AS calendar_year
-                       FROM aln;""")  # Align to calendar
-        con.execute("COPY ttm_aligned TO ? (FORMAT PARQUET, COMPRESSION ZSTD);", [str(fact_ttm_aligned_path)])
-        print(f"✅ wrote {fact_ttm_aligned_path}")
-
-    dim_sec = build_dim_security(FACTS, DATA, MARTS / "dim_security.parquet")  # Build dim_security (light)
-    print(f"✅ wrote {MARTS / 'dim_security.parquet'}  rows={len(dim_sec):,}")  # Log count
-
-    with duckdb.connect() as con:  # Final latest view in DuckDB
-        con.execute("PRAGMA threads=auto;")
-        con.execute(f"PRAGMA temp_directory='{str(TMP_DUCKDB).replace(\"'\",\"''\")}';")
-        con.execute("CREATE OR REPLACE VIEW ttm_aligned AS SELECT * FROM read_parquet(?);", [str(fact_ttm_aligned_path)])
-        con.execute("CREATE OR REPLACE VIEW dim_security AS SELECT * FROM read_parquet(?);", [str(MARTS / "dim_security.parquet")])
+                       FROM aln;""")  # Align TTM rows to calendar quarter/year based on company FYE
+        con.execute("COPY ttm_aligned TO ? (FORMAT PARQUET, COMPRESSION ZSTD);", [str(fact_ttm_aligned_path)])  # Write aligned TTM Parquet
+        print(f"✅ wrote {fact_ttm_aligned_path}")  # Log aligned TTM output
+    dim_sec = build_dim_security(FACTS, DATA, MARTS / "dim_security.parquet")  # Build dim_security (small, fine in pandas)
+    print(f"✅ wrote {MARTS / 'dim_security.parquet'}  rows={len(dim_sec):,}")  # Log number of rows in dim_security
+    with duckdb.connect() as con:  # Reopen DuckDB to produce final latest TTM view
+        con.execute("PRAGMA threads=auto;")  # Use all CPU threads
+        con.execute(f"PRAGMA temp_directory='{str(TMP_DUCKDB).replace(\"'\",\"''\")}';")  # Ensure spills go to our temp directory
+        con.execute("CREATE OR REPLACE VIEW ttm_aligned AS SELECT * FROM read_parquet(?);", [str(fact_ttm_aligned_path)])  # Register aligned TTM as view
+        con.execute("CREATE OR REPLACE VIEW dim_security AS SELECT * FROM read_parquet(?);", [str(MARTS / "dim_security.parquet")])  # Register dim_security as view
         con.execute("""CREATE OR REPLACE TABLE vw_latest_ttm AS
                        WITH a AS (
                          SELECT cik, tag, period_type, calendar_year, calendar_quarter, TTM_value
@@ -314,15 +295,13 @@ def main():  # Orchestrate streaming + DuckDB pipeline
                               r.TTM_value AS ttm_value
                        FROM ranked r LEFT JOIN dim_security s USING(cik)
                        WHERE rn=1
-                       ORDER BY ttm_value DESC NULLS LAST;""")  # Latest per (cik,tag)
-        con.execute("COPY vw_latest_ttm TO ? (FORMAT PARQUET, COMPRESSION ZSTD);", [str(latest_ttm_path)])
-        print(f"✅ wrote {latest_ttm_path}")
+                       ORDER BY ttm_value DESC NULLS LAST;""")  # Keep only the most recent (calendar_year, calendar_quarter) per (cik, tag)
+        con.execute("COPY vw_latest_ttm TO ? (FORMAT PARQUET, COMPRESSION ZSTD);", [str(latest_ttm_path)])  # Write latest TTM view
+        print(f"✅ wrote {latest_ttm_path}")  # Log latest TTM view output
+    try:  # Optional preview for quick sanity checking
+        vw = pd.read_parquet(MARTS / "vw_latest_ttm.parquet")  # Load the latest view into pandas
+        print("\nTop 10 latest TTM (any tag):")  # Heading for console preview
+        print(vw.head(10))  # Show first 10 rows (most valuable by default sort)
+    except Exception as e: print(f"Note: could not preview vw_latest_ttm due to: {e}")  # If parquet reader fails, print reason
 
-    try:
-        vw = pd.read_parquet(MARTS / "vw_latest_ttm.parquet")  # Optional preview
-        print("\nTop 10 latest TTM (any tag):")
-        print(vw.head(10))
-    except Exception as e:
-        print(f"Note: could not preview vw_latest_ttm due to: {e}")
-
-if __name__ == "__main__": main()  # Run
+if __name__ == "__main__": main()  # Standard script guard to run main() when executed directly
