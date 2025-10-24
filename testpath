@@ -138,7 +138,7 @@ def main():  # Entry point orchestrating streaming ingestion and DuckDB transfor
     print(f"✅ wrote {raw_parquet_path}")  # Log the raw parquet output location
     with duckdb.connect() as con:  # Open a DuckDB connection that auto-closes via context manager
         con.execute("PRAGMA threads=auto;")  # Use all CPU threads available
-        con.execute(f"PRAGMA temp_directory='{str(TMP_DUCKDB).replace(\"'\",\"''\")}';")  # Set spill directory for large intermediate operations
+        con.execute(f'PRAGMA temp_directory=\'{str(TMP_DUCKDB).replace("'", "''")}\';')
         con.execute("PRAGMA memory_limit='85%';")  # Cap DuckDB memory usage to avoid OS thrashing
         con.execute("CREATE OR REPLACE TEMP VIEW raw AS SELECT * FROM read_parquet(?);", [str(raw_parquet_path)])  # Register raw parquet as a temp view
         con.execute("""CREATE OR REPLACE TABLE best AS
@@ -275,7 +275,7 @@ def main():  # Entry point orchestrating streaming ingestion and DuckDB transfor
     print(f"✅ wrote {MARTS / 'dim_security.parquet'}  rows={len(dim_sec):,}")  # Log number of rows in dim_security
     with duckdb.connect() as con:  # Reopen DuckDB to produce final latest TTM view
         con.execute("PRAGMA threads=auto;")  # Use all CPU threads
-        con.execute(f"PRAGMA temp_directory='{str(TMP_DUCKDB).replace(\"'\",\"''\")}';")  # Ensure spills go to our temp directory
+        con.execute("PRAGMA temp_directory=?", [str(TMP_DUCKDB)]) # Ensure spills go to our temp directory
         con.execute("CREATE OR REPLACE VIEW ttm_aligned AS SELECT * FROM read_parquet(?);", [str(fact_ttm_aligned_path)])  # Register aligned TTM as view
         con.execute("CREATE OR REPLACE VIEW dim_security AS SELECT * FROM read_parquet(?);", [str(MARTS / "dim_security.parquet")])  # Register dim_security as view
         con.execute("""CREATE OR REPLACE TABLE vw_latest_ttm AS
