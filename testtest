@@ -270,6 +270,10 @@ def duckdb_transforms(raw_path: Path,
         con.execute(f"COPY ttm_aligned TO {sql_path(ttm_aligned_path)} (FORMAT PARQUET, COMPRESSION ZSTD);")
         status(f"✅ wrote {ttm_aligned_path}")
 
+        # FIX: ensure name conflict doesn't recur — keep ttm_aligned as a VIEW mapped to parquet
+        con.execute("DROP TABLE IF EXISTS ttm_aligned;")  # FIX
+        con.execute(f"CREATE OR REPLACE VIEW ttm_aligned AS SELECT * FROM read_parquet({sql_path(ttm_aligned_path)});")  # FIX
+
         # ---- final latest TTM (needs dim_security if available)
         dim_sec_path = MARTS / "dim_security.parquet"
         if dim_sec_path.exists():
@@ -278,7 +282,7 @@ def duckdb_transforms(raw_path: Path,
             con.execute("""CREATE OR REPLACE VIEW dim_security AS
                            SELECT CAST(NULL AS BIGINT) cik, CAST(NULL AS VARCHAR) ticker, CAST(NULL AS VARCHAR) company_name
                            WHERE 1=0;""")
-        con.execute(f"CREATE OR REPLACE VIEW ttm_aligned AS SELECT * FROM read_parquet({sql_path(ttm_aligned_path)});")
+        # (Removed duplicate CREATE VIEW ttm_aligned … to avoid table/view clash)  # FIX
 
         safe_unlink(latest_ttm_path)
         con.execute("""CREATE OR REPLACE TABLE vw_latest_ttm AS
