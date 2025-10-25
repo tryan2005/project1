@@ -26,10 +26,10 @@ for d in (MARTS, LOGS, TMP_DUCKDB): d.mkdir(parents=True, exist_ok=True)
 # ------------------ tiny utils ------------------
 def status(msg: str): print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 def sql_path(p: Path) -> str: return "'" + str(p).replace("'", "''") + "'"
-def safe_unlink(p: Path): 
+def safe_unlink(p: Path):
     try: p.unlink(missing_ok=True)
     except PermissionError:
-        for i in range(6): 
+        for i in range(6):
             time.sleep(0.3*(i+1)); gc.collect()
             try: p.unlink(); break
             except PermissionError: pass
@@ -232,13 +232,13 @@ def duckdb_transforms(raw_path: Path,
                        FROM w
                        WHERE (period_type='instant' OR cnt4=4) AND TTM_value IS NOT NULL;""")
 
-        # ---- fiscal year end month
+        # ---- fiscal year end month  (FIX: quote "end")
         safe_unlink(fye_path)
         con.execute("""CREATE OR REPLACE TABLE dim_fiscal_year_end AS
                        WITH fy AS (
-                         SELECT cik, TRY_CAST(end AS DATE) AS end_dt
+                         SELECT cik, TRY_CAST("end" AS DATE) AS end_dt
                          FROM best
-                         WHERE period_type='duration' AND fp='FY' AND end IS NOT NULL
+                         WHERE period_type='duration' AND fp='FY' AND "end" IS NOT NULL
                        ),
                        months AS (
                          SELECT cik, EXTRACT(MONTH FROM end_dt)::INT AS fye_month, COUNT(*) AS cnt
