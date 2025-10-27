@@ -1,5 +1,4 @@
-# build_all_marts_v2.py — compact, resumable, chunked
-# pip install pandas pyarrow duckdb orjson
+pip install pandas pyarrow duckdb orjson
 import os, sys, gc, time
 from pathlib import Path
 from datetime import datetime
@@ -7,10 +6,8 @@ from typing import Dict, Tuple
 import pandas as pd
 import pyarrow as pa, pyarrow.parquet as pq
 import duckdb
-# ------------------ fast json (optional) ------------------
 try: import orjson as _json
 except Exception: import json as _json
-# ------------------ paths ------------------
 BASE = Path(r"C:\smilefund_project")
 FACTS = BASE / r"data\sec\company_facts"
 DATA  = BASE / r"data\sec"
@@ -19,7 +16,6 @@ MARTS = WARE / "marts_v2"
 LOGS  = MARTS / "_logs"
 TMP_DUCKDB = MARTS / "_duckdb_tmp"
 for d in (MARTS, LOGS, TMP_DUCKDB): d.mkdir(parents=True, exist_ok=True)
-# ------------------ tiny utils ------------------
 def status(msg: str): print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 def sql_path(p: Path) -> str: return "'" + str(p).replace("'", "''") + "'"
 def safe_unlink(p: Path):
@@ -37,7 +33,6 @@ def set_duckdb(con, threads: int = None, memory: str = "8GB"):
     con.execute(f"PRAGMA memory_limit='{memory}';")
     con.execute("SET preserve_insertion_order=false;")
     status(f"DuckDB threads={t}, mem={memory}, tmp={TMP_DUCKDB}")
-# ------------------ constants / helpers ------------------
 USD_UNITS_MULT: Dict[str,int] = {
     "USD":1,"USD$":1,"USDthousands":1_000,"USDThousands":1_000,
     "USDm":1_000_000,"USDmillions":1_000_000,"USDMillions":1_000_000
@@ -76,8 +71,7 @@ def iter_all_us_gaap_usd(cik: int, data: dict):
                 yield {"cik":cik,"tag":tag,"unit":unit,"fy":int(fy),"fp":str(fp),"form":str(form),
                        "filed":rec.get("filed"),"start":rec.get("start"),"end":rec.get("end"),
                        "period_type":pt,"value":value}
-# ------------------ Phase A: JSON → raw parquet (streaming) ------------------
-def ingest_json_to_raw(raw_path: Path, buffer_rows: int = 15_000):
+def ingest_json_to_raw(raw_path: Path, buffer_rows: int = 30_000):
     arrow_schema = pa.schema([
         ("cik",pa.int64()),("tag",pa.string()),("unit",pa.string()),
         ("fy",pa.int32()),("fp",pa.string()),("form",pa.string()),
@@ -104,7 +98,6 @@ def ingest_json_to_raw(raw_path: Path, buffer_rows: int = 15_000):
         writer.write_table(tbl)
     if writer: writer.close()
     if not raw_path.exists(): raise RuntimeError("Raw parquet not created.")
-# ------------------ Phase B/C: DuckDB transforms (chunked + resumable) ------------------
 def duckdb_transforms(raw_path: Path,
                       best_path: Path,
                       qtrue_path: Path,
@@ -115,9 +108,7 @@ def duckdb_transforms(raw_path: Path,
                       memory: str = "8GB"):
     with duckdb.connect() as con:
         set_duckdb(con, threads, memory)
-        # temp view over raw parquet
         con.execute(f"CREATE OR REPLACE TEMP VIEW raw AS SELECT * FROM read_parquet({sql_path(raw_path)});")
-        # ---- BEST: skip if parquet exists; else build per-tag and write parquet
         if best_path.exists():
             con.execute("DROP VIEW IF EXISTS best;")
             con.execute(f"CREATE VIEW best AS SELECT * FROM read_parquet({sql_path(best_path)});")
@@ -151,7 +142,6 @@ def duckdb_transforms(raw_path: Path,
             con.execute("DROP VIEW IF EXISTS best;")
             con.execute("DROP TABLE IF EXISTS best;")
             con.execute(f"CREATE VIEW best AS SELECT * FROM read_parquet({sql_path(best_path)});")
-        # ---- quarters_true
         safe_unlink(qtrue_path)
         con.execute("""CREATE OR REPLACE TABLE quarters_true AS
                        WITH dur_q AS (
@@ -194,7 +184,6 @@ def duckdb_transforms(raw_path: Path,
                        UNION ALL SELECT * FROM ins_q
                        UNION ALL SELECT * FROM ins_fy_to_q4;""")
         con.execute(f"COPY quarters_true TO {sql_path(qtrue_path)} (FORMAT PARQUET, COMPRESSION ZSTD);")
-        # ---- ttm (rolling for duration; identity for instant)
         con.execute("""CREATE OR REPLACE TABLE ttm AS
                        WITH base AS (SELECT cik, tag, fy, fp, qn, value, period_type FROM quarters_true),
                        w AS (
@@ -210,8 +199,6 @@ def duckdb_transforms(raw_path: Path,
                        SELECT cik, tag, fy, fp, qn, value, period_type, TTM_value
                        FROM w
                        WHERE (period_type='instant' OR cnt4=4) AND TTM_value IS NOT NULL;""")
-
-        # ---- fiscal year end month  (FIX: quote "end")
         safe_unlink(fye_path)
         con.execute("""CREATE OR REPLACE TABLE dim_fiscal_year_end AS
                        WITH fy AS (
@@ -231,7 +218,6 @@ def duckdb_transforms(raw_path: Path,
                        SELECT cik, fye_month, ((fye_month % 12)+1)::INT AS fiscal_year_start_month
                        FROM ranked WHERE rn=1;""")
         con.execute(f"COPY dim_fiscal_year_end TO {sql_path(fye_path)} (FORMAT PARQUET, COMPRESSION ZSTD);")
-        # ---- align TTM to calendar quarter/year
         safe_unlink(ttm_aligned_path)
         con.execute("""CREATE OR REPLACE TABLE ttm_aligned AS
                        WITH a AS (SELECT t.*, d.fye_month FROM ttm t LEFT JOIN dim_fiscal_year_end d USING(cik)),
@@ -245,11 +231,8 @@ def duckdb_transforms(raw_path: Path,
                               CASE WHEN quarter_end_month <= fye_month THEN fy ELSE fy - 1 END AS calendar_year
                        FROM aln;""")
         con.execute(f"COPY ttm_aligned TO {sql_path(ttm_aligned_path)} (FORMAT PARQUET, COMPRESSION ZSTD);")
-        # FIX: ensure name conflict doesn't recur — keep ttm_aligned as a VIEW mapped to parquet
-        con.execute("DROP TABLE IF EXISTS ttm_aligned;")  # FIX
-        con.execute(f"CREATE OR REPLACE VIEW ttm_aligned AS SELECT * FROM read_parquet({sql_path(ttm_aligned_path)});")  # FIX
-
-        # ---- final latest TTM (needs dim_security if available)
+        con.execute("DROP TABLE IF EXISTS ttm_aligned;")
+        con.execute(f"CREATE OR REPLACE VIEW ttm_aligned AS SELECT * FROM read_parquet({sql_path(ttm_aligned_path)});")
         dim_sec_path = MARTS / "dim_security.parquet"
         if dim_sec_path.exists():
             con.execute(f"CREATE OR REPLACE VIEW dim_security AS SELECT * FROM read_parquet({sql_path(dim_sec_path)});")
@@ -257,7 +240,6 @@ def duckdb_transforms(raw_path: Path,
             con.execute("""CREATE OR REPLACE VIEW dim_security AS
                            SELECT CAST(NULL AS BIGINT) cik, CAST(NULL AS VARCHAR) ticker, CAST(NULL AS VARCHAR) company_name
                            WHERE 1=0;""")
-        # (Removed duplicate CREATE VIEW ttm_aligned … to avoid table/view clash)  # FIX
         safe_unlink(latest_ttm_path)
         con.execute("""CREATE OR REPLACE TABLE vw_latest_ttm AS
                        WITH a AS (
@@ -278,7 +260,6 @@ def duckdb_transforms(raw_path: Path,
                        WHERE rn=1
                        ORDER BY ttm_value DESC NULLS LAST;""")
         con.execute(f"COPY vw_latest_ttm TO {sql_path(latest_ttm_path)} (FORMAT PARQUET, COMPRESSION ZSTD);")
-# ------------------ dim_security (tiny; pandas) ------------------
 def build_dim_security(out_path: Path):
     rows, i = [], 0
     for de in os.scandir(FACTS):
@@ -311,7 +292,6 @@ def build_dim_security(out_path: Path):
             dim = dim.merge(tm[["cik","ticker"]], on="cik", how="left", suffixes=("","_map"))
             dim["ticker"] = dim["ticker_map"].combine_first(dim["ticker"]); dim.drop(columns=["ticker_map"], inplace=True, errors="ignore")
     dim.to_parquet(out_path)
-# ------------------ orchestrator ------------------
 def main():
     raw_p   = MARTS / "_raw_us_gaap_usd.parquet"
     best_p  = MARTS / "_best.parquet"
@@ -320,23 +300,17 @@ def main():
     fye_p   = MARTS / "dim_fiscal_year_end.parquet"
     latest  = MARTS / "vw_latest_ttm.parquet"
     dimsec  = MARTS / "dim_security.parquet"
-    # Phase A (skip if raw exists)
     if raw_p.exists():
         status(f"found existing raw, skipping ingest: {raw_p}")
     else:
-        safe_unlink(best_p)  # ensure clean downstream when rebuilding raw
+        safe_unlink(best_p)
         ingest_json_to_raw(raw_p, buffer_rows=30_000)
-    # Phase B/C (chunked + resumable on best)
     duckdb_transforms(raw_p, best_p, qtrue_p, ttm_aln, fye_p, latest, threads=2, memory="8GB")
-    # dim_security
     if not dimsec.exists():
         build_dim_security(dimsec)
-    # quick preview
     try:
         vw = pd.read_parquet(latest)
-# ------------------ run ------------------
 if __name__ == "__main__":
-    # Make it Jupyter-friendly (ignore kernel args)
     if any(k in sys.modules for k in ("ipykernel","IPython")):
         sys.argv = ["build_all_marts_v2.py"]
     main()
