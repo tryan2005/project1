@@ -1,1 +1,3 @@
-# project1
+# SEC Company Facts ETL Pipeline (SMILE Fund Data Warehouse)
+## 📘 Overview
+This project builds a structured **Parquet-based data warehouse** from the SEC’s *Company Facts* dataset...
