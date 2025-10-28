@@ -5,6 +5,7 @@ C:\smilefund_project
 │       ├── company_facts\        # raw SEC JSONs
 │       └── ticker_map.csv        # optional override mapping
 │
+
 ├── warehouse
 │   └── parquet
 │       └── marts_v2
