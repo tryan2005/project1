@@ -1,0 +1,752 @@
+# -*- coding: utf-8 -*-
+"""
+SEC Warehouse - All in One
+- Extract: SEC companyfacts + submissions (cached, rate limited)
+- Transform: earliest-filed ("best") + fiscal logic + Q4 delta when needed
+- Load: append-only star schema Parquet datasets with deterministic IDs
+Author: <your team/email>
+"""
+
+import os, gc, re, time, json, math, glob, queue, threading, datetime
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, Any, List, Optional, Iterable, Tuple
+import pandas as pd
+import pyarrow as pa, pyarrow.parquet as pq
+import duckdb
+try:
+    import orjson as _json
+except Exception:
+    _json = None
+import hashlib
+import requests
+
+# ------------------------------- CONFIG ---------------------------------
+
+BASE = Path(r"C:\smilefund_project")          # project root
+DATA = BASE / "data" / "sec"
+CACHE = DATA / "cache"                        # JSON cache (companyfacts + submissions)
+COMPANY_FACTS_DIR = DATA / "company_facts"    # if you also keep raw downloaded files
+WARE = BASE / "warehouse"
+STAR = WARE / "star"                          # star schema datasets
+LOGS = WARE / "_logs"
+TMP_DUCK = WARE / "_duckdb_tmp"
+for d in [DATA, CACHE, STAR, LOGS, TMP_DUCK]:
+    d.mkdir(parents=True, exist_ok=True)
+
+# Which CIKs to process (demo defaults). Replace with your list loader.
+CIKS: List[str] = []   # e.g., ["0000320193","0000789019", ...]  # Apple, MSFT
+CIK_LIST_FILE = DATA / "ciks.txt"   # optional: one CIK per line
+
+# HTTP settings
+UA = {"User-Agent": "utc-smile-warehouse <[email protected]>"}
+REQS_PER_SEC = 8.0
+CACHE_TTL_HOURS = 24
+
+# Star-schema partitions
+FACT_PARTITION_BY_YEAR = True
+
+# ------------------------- DETERMINISTIC IDS ----------------------------
+
+def h64(s: str) -> int:
+    """Deterministic 64-bit positive int from string (no extra deps)."""
+    d = hashlib.blake2b(s.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(d, byteorder="big", signed=False)
+
+# company_id = CIK (int)
+def company_id_from_cik(cik: str) -> int:
+    return int(str(int(cik)))  # normalize keep leading zeros out
+
+def metric_id_from_tag(xbrl_tag: str) -> int:
+    return h64(f"metric:{xbrl_tag.strip()}")
+
+def unit_id_from_code(unit_code: str) -> int:
+    return h64(f"unit:{unit_code.strip()}")
+
+def filing_id_from_accession(accession: str) -> int:
+    return h64(f"filing:{accession.strip()}")
+
+def security_id_from_fields(cik: str, ticker: str, exchange: str, share_class: str) -> int:
+    key = f"{int(cik)}|{(ticker or '').upper()}|{(exchange or '').upper()}|{(share_class or '').upper()}"
+    return h64(f"security:{key}")
+
+# ---------------------------- UTILITIES ---------------------------------
+
+def status(msg: str):
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+def set_duckdb(con, threads: int = None, memory: str = "8GB"):
+    t = threads or max(1, (os.cpu_count() or 4)//2)
+    con.execute(f"PRAGMA threads={t};")
+    try:
+        con.execute("PRAGMA temp_directory=?", [str(TMP_DUCK)])
+    except Exception:
+        pass
+    con.execute(f"PRAGMA memory_limit='{memory}';")
+    con.execute("SET preserve_insertion_order=false;")
+
+def sql_path(p: Path) -> str:
+    return "'" + str(p).replace("'", "''") + "'"
+
+def parquet_exists(dirpath: Path) -> bool:
+    return bool(glob.glob(str(dirpath / "*.parquet")))
+
+def read_text_fast(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="ignore")
+
+def load_json_bytes(p: Path) -> Any:
+    if _json:
+        return _json.loads(p.read_bytes())
+    return json.loads(read_text_fast(p))
+
+def write_json_bytes(p: Path, obj: Any):
+    if _json:
+        p.write_bytes(_json.dumps(obj))
+    else:
+        p.write_text(json.dumps(obj, ensure_ascii=False))
+
+# ---------------------------- RATE LIMITER -------------------------------
+
+class TokenBucket:
+    def __init__(self, rate_per_sec: float, capacity: float = None):
+        self.rate = rate_per_sec
+        self.capacity = capacity or rate_per_sec
+        self.tokens = self.capacity
+        self.last = time.perf_counter()
+        self.lock = threading.Lock()
+    def take(self, tokens: float = 1.0):
+        while True:
+            with self.lock:
+                now = time.perf_counter()
+                elapsed = now - self.last
+                self.last = now
+                self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+                if self.tokens >= tokens:
+                    self.tokens -= tokens
+                    return
+            time.sleep(max(0.001, tokens/self.rate/2))
+
+bucket = TokenBucket(REQS_PER_SEC)
+
+# ----------------------------- FETCH LAYER -------------------------------
+
+def cache_get_json(path: Path, url: str, ttl_hours: int = CACHE_TTL_HOURS) -> Any:
+    if path.exists():
+        age = time.time() - path.stat().st_mtime
+        if age < ttl_hours*3600:
+            return load_json_bytes(path)
+    # fetch
+    for attempt in range(3):
+        try:
+            bucket.take(1.0)
+            r = requests.get(url, headers=UA, timeout=60)
+            if r.status_code == 429:
+                time.sleep(2.0)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            write_json_bytes(path, data)
+            return data
+        except Exception as e:
+            if attempt == 2:
+                raise
+            time.sleep(1.0 + attempt)
+
+def get_companyfacts(cik: str) -> Any:
+    p = CACHE / f"companyfacts_{int(cik):010d}.json"
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{int(cik):010d}.json"
+    return cache_get_json(p, url)
+
+def get_submissions(cik: str) -> Any:
+    p = CACHE / f"submissions_{int(cik):010d}.json"
+    url = f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json"
+    return cache_get_json(p, url)
+
+# ----------------------- TRANSFORM: BUILD BEST ---------------------------
+
+USD_UNITS_MULT: Dict[str,int] = {
+    "USD":1,"USD$":1,"USDthousands":1_000,"USDThousands":1_000,
+    "USDm":1_000_000,"USDmillions":1_000_000,"USDMillions":1_000_000
+}
+Q_MIN, Q_MAX = 70, 110
+FY_MIN, FY_MAX = 330, 380
+
+def parse_dt(s) -> Optional[pd.Timestamp]:
+    return pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")
+
+def duration_days(start, end) -> Optional[int]:
+    s, e = parse_dt(start), parse_dt(end)
+    if pd.isna(s) or pd.isna(e): return None
+    return int((e - s).days) + 1
+
+def iter_us_gaap_usd_rows(cik: int, cf: dict) -> Iterable[dict]:
+    facts = (cf or {}).get("facts", {}).get("us-gaap", {})
+    for tag, blk in facts.items():
+        units = blk.get("units") or {}
+        for unit, arr in units.items():
+            mult = USD_UNITS_MULT.get(unit)
+            if not mult: 
+                continue
+            for rec in arr:
+                fp, form, fy, val = rec.get("fp"), rec.get("form"), rec.get("fy"), rec.get("val")
+                if val is None or fy is None or fp is None or form is None:
+                    continue
+                ptype = "duration" if rec.get("start") else "instant"
+                if ptype == "duration":
+                    d = duration_days(rec.get("start"), rec.get("end"))
+                    if fp in ("Q1","Q2","Q3"):
+                        if not (form.startswith("10-Q") and d and Q_MIN<=d<=Q_MAX):
+                            continue
+                    elif fp == "FY":
+                        if not (form.startswith("10-K") and d and FY_MIN<=d<=FY_MAX):
+                            continue
+                    elif fp == "Q4":
+                        # ignore raw duration Q4; we will derive from FY - (Q1+Q2+Q3)
+                        continue
+                else:
+                    if fp not in ("Q1","Q2","Q3","Q4","FY"):
+                        continue
+                try:
+                    value = float(val) * mult
+                except Exception:
+                    continue
+                yield {
+                    "cik": int(cik),
+                    "tag": tag,
+                    "unit": unit,
+                    "fy": int(fy),
+                    "fp": str(fp),
+                    "form": str(form),
+                    "filed": rec.get("filed"),
+                    "start": rec.get("start"),
+                    "end": rec.get("end"),
+                    "period_type": ptype,
+                    "value": value
+                }
+
+def build_best_parquet(ciks: List[str], out_parquet: Path) -> None:
+    schema = pa.schema([
+        ("cik", pa.int64()),
+        ("tag", pa.string()),
+        ("unit", pa.string()),
+        ("fy", pa.int32()),
+        ("fp", pa.string()),
+        ("form", pa.string()),
+        ("filed", pa.string()),
+        ("start", pa.string()),
+        ("end", pa.string()),
+        ("period_type", pa.string()),
+        ("value", pa.float64())
+    ])
+    writer = pq.ParquetWriter(out_parquet, schema, compression="zstd")
+    nrows = 0
+    for i, cik in enumerate(ciks, 1):
+        try:
+            cf = get_companyfacts(cik)
+            rows = list(iter_us_gaap_usd_rows(int(cik), cf))
+            if not rows:
+                continue
+            tbl = pa.Table.from_pylist(rows, schema=schema)
+            writer.write_table(tbl)
+            nrows += tbl.num_rows
+        except Exception as e:
+            status(f"warn: {cik} companyfacts failed: {e}")
+        if i % 500 == 0:
+            status(f"… pulled {i:,} CIKs; rows so far ~{nrows:,}")
+    writer.close()
+    status(f"BEST source parquet written: {out_parquet} (~{nrows:,} rows pre-dedupe)")
+    # Deduplicate to earliest filed per (cik, tag, fy, fp, period_type)
+    with duckdb.connect() as con:
+        set_duckdb(con, threads=2, memory="8GB")
+        con.execute(f"CREATE OR REPLACE VIEW raw AS SELECT * FROM read_parquet({sql_path(out_parquet)});")
+        tmp_best = out_parquet.with_name("_best_tmp.parquet")
+        con.execute(f"DROP TABLE IF EXISTS best;")
+        con.execute("""
+            CREATE TABLE best AS
+            WITH ranked AS (
+              SELECT *,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY cik, tag, fy, fp, period_type
+                       ORDER BY filed ASC NULLS LAST
+                     ) AS rn
+              FROM raw
+            )
+            SELECT cik, tag, unit, fy, fp, form, filed, start, "end", period_type, value
+            FROM ranked WHERE rn=1;
+        """)
+        con.execute(f"COPY best TO {sql_path(tmp_best)} (FORMAT PARQUET, COMPRESSION ZSTD);")
+        # swap
+        out_parquet.unlink(missing_ok=True)
+        tmp_best.replace(out_parquet)
+        status("BEST deduped to earliest-filed.")
+
+# -------------------- FYE, TTM, Q4 DERIVATION (DUCKDB) ------------------
+
+def compute_fye_and_q4(best_parquet: Path, fye_out: Path, quarters_out: Path) -> None:
+    with duckdb.connect() as con:
+        set_duckdb(con, threads=2, memory="8GB")
+        con.execute(f"CREATE OR REPLACE VIEW best AS SELECT * FROM read_parquet({sql_path(best_parquet)});")
+        # FYE month detection from FY duration end date
+        con.execute(f"DROP TABLE IF EXISTS dim_fiscal_year_end;")
+        con.execute("""
+            CREATE TABLE dim_fiscal_year_end AS
+            WITH fy AS (
+              SELECT cik, TRY_CAST("end" AS DATE) AS end_dt
+              FROM best
+              WHERE period_type='duration' AND fp='FY' AND "end" IS NOT NULL
+            ),
+            months AS (
+              SELECT cik, EXTRACT(MONTH FROM end_dt)::INT AS fye_month, COUNT(*) AS cnt
+              FROM fy WHERE end_dt IS NOT NULL
+              GROUP BY 1,2
+            ),
+            ranked AS (
+              SELECT *, ROW_NUMBER() OVER (PARTITION BY cik ORDER BY cnt DESC, fye_month DESC) AS rn
+              FROM months
+            )
+            SELECT cik, fye_month, ((fye_month % 12)+1)::INT AS fiscal_year_start_month
+            FROM ranked WHERE rn=1;
+        """)
+        con.execute(f"COPY dim_fiscal_year_end TO {sql_path(fye_out)} (FORMAT PARQUET, COMPRESSION ZSTD);")
+        # build quarters_true with Q4 delta for duration metrics
+        con.execute(f"DROP TABLE IF EXISTS quarters_true;")
+        con.execute("""
+            CREATE TABLE quarters_true AS
+            WITH dur_q AS (
+              SELECT cik, tag, fy, fp,
+                     CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 END AS qn,
+                     value, period_type, unit, form, filed, "end"
+              FROM best WHERE period_type='duration' AND fp IN ('Q1','Q2','Q3')
+            ),
+            dur_fy AS (
+              SELECT cik, tag, fy, value AS fy_value
+              FROM best WHERE period_type='duration' AND fp='FY'
+            ),
+            dur_qsum AS (
+              SELECT cik, tag, fy, SUM(value) AS q123
+              FROM dur_q GROUP BY 1,2,3
+            ),
+            dur_q4 AS (
+              SELECT f.cik, f.tag, f.fy, 'Q4' AS fp, 4 AS qn,
+                     (f.fy_value - q.q123) AS value,
+                     'duration' AS period_type,
+                     NULL AS unit, NULL AS form, NULL AS filed, NULL AS "end"
+              FROM dur_fy f JOIN dur_qsum q USING(cik, tag, fy)
+            ),
+            ins_q AS (
+              SELECT cik, tag, fy, fp,
+                     CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 END AS qn,
+                     value, period_type, unit, form, filed, "end"
+              FROM best WHERE period_type='instant' AND fp IN ('Q1','Q2','Q3','Q4')
+            ),
+            ins_fy AS (SELECT cik, tag, fy, value FROM best WHERE period_type='instant' AND fp='FY'),
+            have_q4 AS (SELECT DISTINCT cik, tag, fy FROM ins_q WHERE fp='Q4'),
+            ins_fy_to_q4 AS (
+              SELECT f.cik, f.tag, f.fy, 'Q4' AS fp, 4 AS qn, f.value, 'instant' AS period_type,
+                     NULL AS unit, NULL AS form, NULL AS filed, NULL AS "end"
+              FROM ins_fy f LEFT JOIN have_q4 h USING(cik, tag, fy) WHERE h.cik IS NULL
+            )
+            SELECT * FROM dur_q
+            UNION ALL SELECT * FROM dur_q4
+            UNION ALL SELECT * FROM ins_q
+            UNION ALL SELECT * FROM ins_fy_to_q4;
+        """)
+        con.execute(f"COPY quarters_true TO {sql_path(quarters_out)} (FORMAT PARQUET, COMPRESSION ZSTD);")
+
+# -------------------------- SUBMISSIONS → FILING -------------------------
+
+def build_dim_filing_from_submissions(ciks: List[str], out_dir: Path) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for i, cik in enumerate(ciks, 1):
+        try:
+            s = get_submissions(cik) or {}
+            c_cik = int(s.get("cik") or int(cik))
+            company = s.get("name") or s.get("entityType") or ""
+            # recent 'filings' → 'recent' lists
+            recent = (s.get("filings") or {}).get("recent") or {}
+            forms = recent.get("form") or []
+            filingDates = recent.get("filingDate") or []
+            acceptedDates = recent.get("acceptanceDateTime") or []
+            accession = recent.get("accessionNumber") or []
+            periodEnds = recent.get("periodOfReport") or []
+            primaryDocs = recent.get("primaryDocument") or []
+            # Build rows
+            for j in range(len(forms)):
+                form = forms[j]
+                fd = filingDates[j] if j < len(filingDates) else None
+                ad = acceptedDates[j] if j < len(acceptedDates) else None
+                an = accession[j] if j < len(accession) else None
+                pe = periodEnds[j] if j < len(periodEnds) else None
+                pd = primaryDocs[j] if j < len(primaryDocs) else None
+                if not an or not form or not fd:
+                    continue
+                # URL: https://www.sec.gov/Archives/edgar/data/CIK(without leading zeros)/ACCESSION(without dashes)/
+                an_nodash = re.sub(r"[^0-9]", "", an)
+                cik_nolead = str(int(c_cik))
+                url = f"https://www.sec.gov/Archives/edgar/data/{cik_nolead}/{an_nodash}/"
+                rows.append({
+                    "company_id": company_id_from_cik(str(c_cik)),
+                    "filing_id": filing_id_from_accession(an),
+                    "accession_number": an,
+                    "form_type": form,
+                    "filing_date": fd,
+                    "accepted_date": ad[:10] if ad else None,
+                    "period_end_date": pe,
+                    "filing_url": url,
+                    "is_amendment": form.endswith("/A")
+                })
+        except Exception as e:
+            status(f"warn: submissions {cik}: {e}")
+        if i % 500 == 0:
+            status(f"… submissions pulled {i:,} CIKs")
+    # Write a single parquet file (append model: timestamped)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = out_dir / f"dim_filing_{ts}.parquet"
+    if rows:
+        tbl = pa.Table.from_pandas(pd.DataFrame(rows), preserve_index=False)
+        pq.write_table(tbl, out_path, compression="zstd")
+    return out_path
+
+# --------------------------- STAR APPEND/LOAD ----------------------------
+
+def append_star(best_parquet: Path, fye_parquet: Path, quarters_parquet: Path, filing_dataset_dir: Path):
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Ensure dataset dirs
+    for sub in ["dim_company","dim_security","dim_metric","dim_unit","dim_calendar","dim_filing","fact_financials"]:
+        (STAR / sub).mkdir(parents=True, exist_ok=True)
+
+    with duckdb.connect() as con:
+        set_duckdb(con, threads=2, memory="8GB")
+
+        # Stage inputs
+        con.execute(f"CREATE OR REPLACE VIEW best AS SELECT * FROM read_parquet({sql_path(best_parquet)});")
+        con.execute(f"CREATE OR REPLACE VIEW fye AS SELECT * FROM read_parquet({sql_path(fye_parquet)});")
+        con.execute(f"CREATE OR REPLACE VIEW quarters AS SELECT * FROM read_parquet({sql_path(quarters_parquet)});")
+
+        # ---------------- dim_company (CIK as ID) ----------------
+        # Build company seeds from companyfacts JSON cache (entityName + ticker snapshot) for display/name fields
+        # Fallback to names from submissions if needed.
+        rows = []
+        for jf in glob.glob(str(CACHE / "companyfacts_*.json")):
+            try:
+                d = load_json_bytes(Path(jf))
+                cik = int(d.get("cik"))
+                name = (d.get("entityName") or "").strip()
+                rows.append({"company_id": company_id_from_cik(str(cik)),
+                             "cik": f"{cik:010d}",
+                             "name": name})
+            except Exception:
+                pass
+        df_co = pd.DataFrame(rows).drop_duplicates("company_id")
+        tbl_co = pa.Table.from_pandas(df_co, preserve_index=False) if not df_co.empty else pa.Table.from_arrays([pa.array([], type=pa.int64()), pa.array([], type=pa.string()), pa.array([], type=pa.string())], names=["company_id","cik","name"])
+        temp_company = STAR / "_tmp_dim_company.parquet"
+        pq.write_table(tbl_co, temp_company, compression="zstd")
+        con.execute(f"CREATE OR REPLACE VIEW company_src AS SELECT * FROM read_parquet({sql_path(temp_company)});")
+        # join FYE month
+        con.execute("""
+            CREATE OR REPLACE VIEW dim_company_src AS
+            SELECT
+              s.company_id,
+              s.cik,
+              s.name,
+              NULL::VARCHAR AS sector,
+              NULL::VARCHAR AS industry,
+              COALESCE(f.fye_month,12)::INT AS fiscal_year_end_month
+            FROM company_src s
+            LEFT JOIN fye f ON f.cik = s.company_id
+        """)
+        if parquet_exists(STAR / "dim_company"):
+            con.execute(f"CREATE OR REPLACE VIEW dim_company_existing AS SELECT * FROM read_parquet('{(STAR / 'dim_company')}/*.parquet');")
+        else:
+            con.execute("CREATE OR REPLACE VIEW dim_company_existing AS SELECT CAST(NULL AS BIGINT) company_id, CAST(NULL AS VARCHAR) cik, CAST(NULL AS VARCHAR) name, CAST(NULL AS VARCHAR) sector, CAST(NULL AS VARCHAR) industry, CAST(NULL AS INTEGER) fiscal_year_end_month WHERE FALSE;")
+
+        con.execute("""
+            CREATE OR REPLACE VIEW dim_company_new AS
+            SELECT s.*
+            FROM dim_company_src s
+            LEFT JOIN dim_company_existing e ON s.company_id = e.company_id
+            WHERE e.company_id IS NULL
+        """)
+        new_company_count = con.execute("SELECT COUNT(*) FROM dim_company_new").fetchone()[0]
+        if new_company_count:
+            out = STAR / "dim_company" / f"dim_company_{ts}.parquet"
+            con.execute(f"COPY (SELECT * FROM dim_company_new) TO {sql_path(out)} (FORMAT PARQUET);")
+
+        # ---------------- dim_metric ----------------
+        con.execute("""
+            CREATE OR REPLACE VIEW metric_src AS
+            SELECT DISTINCT tag AS xbrl_tag FROM best WHERE tag IS NOT NULL
+        """)
+        if parquet_exists(STAR / "dim_metric"):
+            con.execute(f"CREATE OR REPLACE VIEW dim_metric_existing AS SELECT * FROM read_parquet('{(STAR / 'dim_metric')}/*.parquet');")
+        else:
+            con.execute("CREATE OR REPLACE VIEW dim_metric_existing AS SELECT CAST(NULL AS BIGINT) metric_id, CAST(NULL AS VARCHAR) metric_name, CAST(NULL AS VARCHAR) xbrl_tag, CAST(NULL AS VARCHAR) normal_balance WHERE FALSE;")
+        # Build ids deterministically in SQL via a Python UDF is clunky; do in Python:
+        metric_tags = [r[0] for r in con.execute("SELECT xbrl_tag FROM metric_src EXCEPT SELECT xbrl_tag FROM dim_metric_existing;").fetchall()]
+        if metric_tags:
+            rows = []
+            for tag in metric_tags:
+                mid = metric_id_from_tag(tag)
+                rows.append({"metric_id": mid, "metric_name": tag, "xbrl_tag": tag, "normal_balance": None})
+            pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows)), STAR / "dim_metric" / f"dim_metric_{ts}.parquet", compression="zstd")
+
+        con.execute(f"CREATE OR REPLACE VIEW dim_metric_all AS SELECT * FROM read_parquet('{(STAR / 'dim_metric')}/*.parquet');")
+
+        # ---------------- dim_unit ----------------
+        con.execute("""
+            CREATE OR REPLACE VIEW unit_src AS
+            SELECT DISTINCT unit AS unit_code FROM best WHERE unit IS NOT NULL
+        """)
+        if parquet_exists(STAR / "dim_unit"):
+            con.execute(f"CREATE OR REPLACE VIEW dim_unit_existing AS SELECT * FROM read_parquet('{(STAR / 'dim_unit')}/*.parquet');")
+        else:
+            con.execute("CREATE OR REPLACE VIEW dim_unit_existing AS SELECT CAST(NULL AS BIGINT) unit_id, CAST(NULL AS VARCHAR) unit_code, CAST(NULL AS VARCHAR) category, CAST(NULL AS VARCHAR) iso_currency, CAST(NULL AS INTEGER) decimals_hint, CAST(NULL AS VARCHAR) description WHERE FALSE;")
+
+        unit_codes = [r[0] for r in con.execute("SELECT unit_code FROM unit_src EXCEPT SELECT unit_code FROM dim_unit_existing;").fetchall()]
+        if unit_codes:
+            rows = []
+            for u in unit_codes:
+                rows.append({
+                    "unit_id": unit_id_from_code(u),
+                    "unit_code": u,
+                    "category": "currency",
+                    "iso_currency": "USD",
+                    "decimals_hint": 2,
+                    "description": "Reported unit (scaled USD variant retained)"
+                })
+            pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows)), STAR / "dim_unit" / f"dim_unit_{ts}.parquet", compression="zstd")
+
+        con.execute(f"CREATE OR REPLACE VIEW dim_unit_all AS SELECT * FROM read_parquet('{(STAR / 'dim_unit')}/*.parquet');")
+
+        # ---------------- dim_calendar (Gregorian only) ----------------
+        if parquet_exists(STAR / "dim_calendar"):
+            con.execute(f"CREATE OR REPLACE VIEW dim_calendar_existing AS SELECT * FROM read_parquet('{(STAR / 'dim_calendar')}/*.parquet');")
+        else:
+            con.execute("CREATE OR REPLACE VIEW dim_calendar_existing AS SELECT CAST(NULL AS INTEGER) calendar_id, CAST(NULL AS DATE) date, CAST(NULL AS INTEGER) year, CAST(NULL AS INTEGER) quarter, CAST(NULL AS INTEGER) month, CAST(NULL AS INTEGER) day_of_week WHERE FALSE;")
+
+        con.execute("""
+            CREATE OR REPLACE VIEW cal_src AS
+            SELECT DISTINCT TRY_CAST("end" AS DATE) AS dt
+            FROM best WHERE "end" IS NOT NULL
+        """)
+        con.execute("""
+            CREATE OR REPLACE VIEW cal_derived AS
+            SELECT
+              CAST(strftime('%Y%m%d', dt) AS INTEGER) AS calendar_id,
+              dt AS date,
+              EXTRACT(YEAR FROM dt)::INT AS year,
+              ((EXTRACT(MONTH FROM dt)::INT - 1)/3 + 1)::INT AS quarter,
+              EXTRACT(MONTH FROM dt)::INT AS month,
+              EXTRACT(DOW FROM dt)::INT AS day_of_week
+            FROM cal_src WHERE dt IS NOT NULL
+        """)
+        con.execute("""
+            CREATE OR REPLACE VIEW dim_calendar_new AS
+            SELECT d.* FROM cal_derived d
+            LEFT JOIN dim_calendar_existing e ON d.calendar_id = e.calendar_id
+            WHERE e.calendar_id IS NULL
+        """)
+        new_cal = con.execute("SELECT COUNT(*) FROM dim_calendar_new").fetchone()[0]
+        if new_cal:
+            out = STAR / "dim_calendar" / f"dim_calendar_{ts}.parquet"
+            con.execute(f"COPY (SELECT DISTINCT * FROM dim_calendar_new) TO {sql_path(out)} (FORMAT PARQUET);")
+
+        # ---------------- dim_filing (already materialized by builder) ----------------
+        # Create 'all' view from dataset
+        con.execute(f"CREATE OR REPLACE VIEW dim_filing_all AS SELECT * FROM read_parquet('{(STAR / 'dim_filing')}/*.parquet');")
+
+        # ---------------- fact_financials ----------------
+        # Stage join: map to IDs + compute fiscal fields per company using fye
+        con.execute(f"CREATE OR REPLACE VIEW dim_company_all AS SELECT * FROM read_parquet('{(STAR / 'dim_company')}/*.parquet');")
+        con.execute(f"CREATE OR REPLACE VIEW dim_metric_all AS SELECT * FROM read_parquet('{(STAR / 'dim_metric')}/*.parquet');")
+        con.execute(f"CREATE OR REPLACE VIEW dim_unit_all AS SELECT * FROM read_parquet('{(STAR / 'dim_unit')}/*.parquet');")
+        con.execute(f"CREATE OR REPLACE VIEW dim_calendar_all AS SELECT * FROM read_parquet('{(STAR / 'dim_calendar')}/*.parquet');")
+
+        # Map filing by (form_type, filing_date, period_end_date) → filing_id
+        con.execute("""
+            CREATE OR REPLACE VIEW filing_lu AS
+            SELECT form_type, TRY_CAST(filing_date AS DATE) AS filing_date, TRY_CAST(period_end_date AS DATE) AS period_end_date, filing_id
+            FROM dim_filing_all
+        """)
+
+        # Build stage rows from BEST (earliest filed)
+        con.execute("""
+            CREATE OR REPLACE VIEW stage_fact AS
+            SELECT
+              CAST(b.cik AS BIGINT) AS company_id,
+              b.tag AS xbrl_tag,
+              b.unit AS unit_code,
+              CAST(strftime('%Y%m%d', TRY_CAST(b."end" AS DATE)) AS INTEGER) AS calendar_id,
+              b.value,
+              b.period_type,
+              b.form AS form_type,
+              TRY_CAST(b.filed AS DATE) AS filing_date,
+              TRY_CAST(b."end" AS DATE) AS period_end_date
+            FROM best b
+            WHERE b.value IS NOT NULL AND b."end" IS NOT NULL
+        """)
+
+        # Compute fiscal fields per fact using company FYE
+        con.execute("""
+            CREATE OR REPLACE VIEW stage_fact_fiscal AS
+            SELECT s.*,
+                   COALESCE(ff.fye_month,12)::INT AS fye_month,
+                   CASE WHEN EXTRACT(MONTH FROM s.period_end_date) <= COALESCE(ff.fye_month,12)
+                        THEN EXTRACT(YEAR FROM s.period_end_date)::INT
+                        ELSE (EXTRACT(YEAR FROM s.period_end_date)::INT + 1) END AS fiscal_year,
+                   CONCAT('Q', 1 + (((EXTRACT(MONTH FROM s.period_end_date)::INT - COALESCE(ff.fye_month,12) + 12) % 12) / 3)) AS fiscal_quarter,
+                   ( ((EXTRACT(MONTH FROM s.period_end_date)::INT - COALESCE(ff.fye_month,12) + 12) % 12) + 1 )::INT AS fiscal_month
+            FROM stage_fact s
+            LEFT JOIN fye ff ON ff.cik = s.company_id
+        """)
+
+        # Map to surrogate deterministic IDs
+        # metric_id/unit_id in Python to preserve hash function—materialize small temp tables
+        tags = [r[0] for r in con.execute("SELECT DISTINCT xbrl_tag FROM stage_fact_fiscal").fetchall()]
+        tag_map = pd.DataFrame([{"xbrl_tag": t, "metric_id": metric_id_from_tag(t)} for t in tags]) if tags else pd.DataFrame(columns=["xbrl_tag","metric_id"])
+        tag_map_path = STAR / "_tmp_metric_map.parquet"
+        if not tag_map.empty: pq.write_table(pa.Table.from_pandas(tag_map), tag_map_path, compression="zstd")
+        con.execute(f"CREATE OR REPLACE VIEW tag_map AS SELECT * FROM read_parquet({sql_path(tag_map_path)})") if not tag_map.empty else con.execute("CREATE OR REPLACE VIEW tag_map AS SELECT CAST(NULL AS VARCHAR) xbrl_tag, CAST(NULL AS BIGINT) metric_id WHERE FALSE;")
+
+        units = [r[0] for r in con.execute("SELECT DISTINCT unit_code FROM stage_fact_fiscal").fetchall()]
+        unit_map = pd.DataFrame([{"unit_code": u, "unit_id": unit_id_from_code(u)} for u in units]) if units else pd.DataFrame(columns=["unit_code","unit_id"])
+        unit_map_path = STAR / "_tmp_unit_map.parquet"
+        if not unit_map.empty: pq.write_table(pa.Table.from_pandas(unit_map), unit_map_path, compression="zstd")
+        con.execute(f"CREATE OR REPLACE VIEW unit_map AS SELECT * FROM read_parquet({sql_path(unit_map_path)})") if not unit_map.empty else con.execute("CREATE OR REPLACE VIEW unit_map AS SELECT CAST(NULL AS VARCHAR) unit_code, CAST(NULL AS BIGINT) unit_id WHERE FALSE;")
+
+        con.execute("""
+            CREATE OR REPLACE VIEW staged_ids AS
+            SELECT
+              s.company_id,
+              tm.metric_id,
+              s.calendar_id,
+              um.unit_id,
+              s.value,
+              s.fiscal_year,
+              s.fiscal_quarter,
+              s.fiscal_month,
+              s.period_type,
+              fl.filing_id
+            FROM stage_fact_fiscal s
+            LEFT JOIN tag_map tm   ON s.xbrl_tag = tm.xbrl_tag
+            LEFT JOIN unit_map um  ON s.unit_code = um.unit_code
+            LEFT JOIN filing_lu fl ON s.form_type = fl.form_type
+                                  AND s.filing_date IS NOT DISTINCT FROM fl.filing_date
+                                  AND s.period_end_date IS NOT DISTINCT FROM fl.period_end_date
+            WHERE tm.metric_id IS NOT NULL AND um.unit_id IS NOT NULL
+        """)
+
+        # Existing fact keys for dedupe
+        if parquet_exists(STAR / "fact_financials"):
+            con.execute(f"CREATE OR REPLACE VIEW fact_existing AS SELECT company_id, metric_id, calendar_id, unit_id FROM read_parquet('{(STAR / 'fact_financials')}/*.parquet');")
+        else:
+            con.execute("CREATE OR REPLACE VIEW fact_existing AS SELECT CAST(NULL AS BIGINT) company_id, CAST(NULL AS BIGINT) metric_id, CAST(NULL AS INTEGER) calendar_id, CAST(NULL AS BIGINT) unit_id WHERE FALSE;")
+
+        con.execute("""
+            CREATE OR REPLACE TABLE fact_new AS
+            SELECT s.*
+            FROM staged_ids s
+            LEFT JOIN fact_existing e
+              ON s.company_id = e.company_id
+             AND s.metric_id  = e.metric_id
+             AND s.calendar_id= e.calendar_id
+             AND s.unit_id    = e.unit_id
+            WHERE e.company_id IS NULL
+        """)
+        new_fact_count = con.execute("SELECT COUNT(*) FROM fact_new").fetchone()[0]
+        if new_fact_count:
+            if FACT_PARTITION_BY_YEAR:
+                con.execute("""
+                    CREATE OR REPLACE VIEW fact_new_wyear AS
+                    SELECT s.*, CAST(s.calendar_id/10000 AS INT) AS year_partition
+                    FROM fact_new s
+                """)
+                years = [r[0] for r in con.execute("SELECT DISTINCT year_partition FROM fact_new_wyear").fetchall()]
+                for y in years:
+                    out = STAR / "fact_financials" / f"y={y}" / f"fact_financials_{y}_{ts}.parquet"
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    con.execute(f"""
+                        COPY (
+                          SELECT company_id, metric_id, calendar_id, CAST(value AS DOUBLE) AS value,
+                                 unit_id, filing_id, period_type,
+                                 fiscal_year, fiscal_quarter, fiscal_month
+                          FROM fact_new_wyear WHERE year_partition={y}
+                          ORDER BY company_id, metric_id, calendar_id, unit_id
+                        ) TO {sql_path(out)} (FORMAT PARQUET);
+                    """)
+            else:
+                out = STAR / "fact_financials" / f"fact_financials_{ts}.parquet"
+                con.execute(f"""
+                    COPY (
+                      SELECT company_id, metric_id, calendar_id, CAST(value AS DOUBLE) AS value,
+                             unit_id, filing_id, period_type,
+                             fiscal_year, fiscal_quarter, fiscal_month
+                      FROM fact_new
+                      ORDER BY company_id, metric_id, calendar_id, unit_id
+                    ) TO {sql_path(out)} (FORMAT PARQUET);
+                """)
+
+        status(f"Appended → companies:{new_company_count} metrics:{len(metric_tags)} units:{len(unit_codes)} calendar:{new_cal} facts:{new_fact_count}")
+
+# ------------------------------- MANIFEST --------------------------------
+
+def write_manifest():
+    manifest = {
+        "schema_version": "1.0.0",
+        "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "partitions": {"fact_financials": "year"},
+        "ids": {
+            "company_id": "CIK (int)",
+            "metric_id": "blake2b-64(tag)",
+            "unit_id": "blake2b-64(unit_code)",
+            "filing_id": "blake2b-64(accessionNumber)",
+            "calendar_id": "YYYYMMDD (int)"
+        },
+        "sources": ["companyfacts", "submissions"],
+        "rate_limit_rps": REQS_PER_SEC,
+        "cache_ttl_hours": CACHE_TTL_HOURS
+    }
+    (STAR / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+# ------------------------------- MAIN ------------------------------------
+
+def load_ciks() -> List[str]:
+    if CIKS:
+        return CIKS
+    if CIK_LIST_FILE.exists():
+        vals = [ln.strip() for ln in CIK_LIST_FILE.read_text().splitlines() if ln.strip()]
+        return [f"{int(v):010d}" for v in vals]
+    # fallback: any cached companyfacts files
+    files = glob.glob(str(CACHE / "companyfacts_*.json"))
+    return [Path(f).stem.split("_")[1] for f in files]
+
+def main():
+    status("SEC Warehouse: start")
+    ciks = load_ciks()
+    if not ciks:
+        status("No CIKs configured. Add to data/sec/ciks.txt (one per line) or set CIKS list.")
+        return
+
+    # 1) Build _best.parquet (earliest-filed) from companyfacts (pull+cache as needed)
+    best_parquet = WARE / "_best.parquet"
+    build_best_parquet(ciks, best_parquet)
+
+    # 2) Compute FYE + quarters_true (Q4 delta) views
+    fye_parquet = WARE / "dim_fiscal_year_end.parquet"
+    quarters_parquet = WARE / "fact_quarters_true.parquet"
+    compute_fye_and_q4(best_parquet, fye_parquet, quarters_parquet)
+
+    # 3) Build/append dim_filing from submissions (pull+cache as needed)
+    filing_out = build_dim_filing_from_submissions(ciks, STAR / "dim_filing")
+    status(f"dim_filing update: {filing_out.name if filing_out else 'no rows'}")
+
+    # 4) Append star schema (dims/facts) from best + fye + submissions
+    append_star(best_parquet, fye_parquet, quarters_parquet, STAR / "dim_filing")
+
+    # 5) Manifest
+    write_manifest()
+    status("SEC Warehouse: done ✔")
+
+if __name__ == "__main__":
+    main()
