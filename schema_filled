@@ -8,41 +8,31 @@ SEC Warehouse — Star v3 (local-only, with built-in seeding + verbose progress)
           dim_security, dim_metric, dim_unit, dim_calendar, dim_filing,
           fact_financials (+ empty dim_company_profile, dim_company_ids)
 """
-
 import os, re, gc, json, time, glob, zipfile, hashlib, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Iterable
-
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import duckdb
-
 # ------------------------------- CONFIG ---------------------------------
-
 BASE = Path(r"C:\smilefund_project")
 DATA = BASE / "data" / "sec"
 FACTS_DIR = DATA / "company_facts"
 SUBMISSIONS_DIR = DATA / "submissions"
 SUBMISSIONS_ZIP = DATA / "submissions.zip"
 TICKERS_JSON = DATA / "company_tickers.json"
-
 WARE = BASE / "warehouse"
 STAR = WARE / "star_v3"              # new output root
 LOGS = WARE / "_logs"
 TMP_DUCK = WARE / "_duckdb_tmp"
-
 for d in [STAR, LOGS, TMP_DUCK]:
     d.mkdir(parents=True, exist_ok=True)
-
 DUCK_THREADS = max(1, (os.cpu_count() or 4)//2)
 DUCK_MEM = "8GB"
-
 # ------------------------------- LOGGING --------------------------------
-
 def status(msg: str):
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
-
 class Timer:
     def __init__(self, label: str):
         self.label = label
@@ -57,35 +47,25 @@ class Timer:
             status(f"✖ {self.label} — ERROR after {dt:,.1f}s: {exc}")
         else:
             status(f"✔ {self.label} — done in {dt:,.1f}s")
-
 # ------------------------- DETERMINISTIC IDS ----------------------------
-
 def h64(s: str) -> int:
     d = hashlib.blake2b(s.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(d, "big", signed=False)
-
 def company_id_from_cik(cik: str) -> int:
     return int(str(int(cik)))  # normalized CIK as int
-
 def metric_id_from_tag(xbrl_tag: str) -> int:
     return h64(f"metric:{xbrl_tag.strip()}")
-
 def unit_id_from_code(unit_code: str) -> int:
     return h64(f"unit:{(unit_code or '').strip()}")
-
 def filing_id_from_accession(accession: str) -> int:
     return h64(f"filing:{(accession or '').strip()}")
-
 def listing_id_from_fields(cik: str, ticker: str, exch: str) -> int:
     key = f"{int(cik)}|{(ticker or '').upper()}|{(exch or '').upper()}"
     return h64(f"listing:{key}")
-
 def security_id_from_fields(cik: str, ticker: str, exch: str, share_class: str) -> int:
     key = f"{int(cik)}|{(ticker or '').upper()}|{(exch or '').upper()}|{(share_class or '').upper()}"
     return h64(f"security:{key}")
-
 # ---------------------------- UTILITIES ---------------------------------
-
 def set_duckdb(con):
     con.execute(f"PRAGMA threads={DUCK_THREADS};")
     try:
@@ -94,24 +74,18 @@ def set_duckdb(con):
         pass
     con.execute(f"PRAGMA memory_limit='{DUCK_MEM}';")
     con.execute("SET preserve_insertion_order=false;")
-
 def sql_path(p: Path) -> str:
     return "'" + str(p).replace("'", "''") + "'"
-
 def parquet_exists(dirpath: Path) -> bool:
     return bool(glob.glob(str(dirpath / "*.parquet"))) or bool(glob.glob(str(dirpath / "**/*.parquet")))
-
 def read_json_local(p: Path) -> Any:
     return json.loads(p.read_text(encoding="utf-8", errors="ignore"))
-
 # --------------------------- LOCAL LOADERS ------------------------------
-
 def iter_companyfacts_files() -> Iterable[Path]:
     if FACTS_DIR.exists():
         for f in os.scandir(FACTS_DIR):
             if f.is_file() and f.name.endswith(".json"):
                 yield Path(f.path)
-
 def load_submissions_local(cik: int) -> Optional[Dict[str, Any]]:
     p = SUBMISSIONS_DIR / f"CIK{cik:010d}.json"
     if p.exists():
@@ -123,7 +97,6 @@ def load_submissions_local(cik: int) -> Optional[Dict[str, Any]]:
                 with zf.open(name) as fh:
                     return json.loads(fh.read().decode("utf-8", errors="ignore"))
     return None
-
 def load_company_tickers() -> pd.DataFrame:
     if not TICKERS_JSON.exists():
         status("note: company_tickers.json not found — listings/security dims may be sparse")
@@ -141,24 +114,19 @@ def load_company_tickers() -> pd.DataFrame:
     df["sic"] = pd.to_numeric(df["sic"], errors="coerce").astype("Int64")
     status(f"tickers loaded: {len(df):,} rows (unique CIKs: {df['cik'].nunique():,})")
     return df[["cik","ticker","title","exchange","sic"]].dropna(subset=["cik"]).drop_duplicates()
-
 # ---------------------- BUILD “BEST” FROM LOCAL FACTS -------------------
-
 USD_UNITS_MULT = {
     "USD":1,"USD$":1,"USDthousands":1_000,"USDThousands":1_000,
     "USDm":1_000_000,"USDmillions":1_000_000,"USDMillions":1_000_000
 }
 Q_MIN, Q_MAX = 70, 110
 FY_MIN, FY_MAX = 330, 380
-
 def parse_dt(s): 
     return pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")
-
 def duration_days(start, end):
     s, e = parse_dt(start), parse_dt(end)
     if pd.isna(s) or pd.isna(e): return None
     return int((e - s).days) + 1
-
 def iter_us_gaap_usd_rows(cik: int, cf: dict) -> Iterable[dict]:
     facts = (cf or {}).get("facts", {}).get("us-gaap", {})
     for tag, blk in facts.items():
@@ -194,7 +162,6 @@ def iter_us_gaap_usd_rows(cik: int, cf: dict) -> Iterable[dict]:
                     "start": rec.get("start"), "end": rec.get("end"),
                     "period_type": ptype, "value": value
                 }
-
 def build_best_parquet(out_parquet: Path) -> None:
     status("collect: scanning company_facts/*.json")
     schema = pa.schema([
@@ -243,9 +210,7 @@ def build_best_parquet(out_parquet: Path) -> None:
             tmp.replace(out_parquet)
             cnt = con.execute("SELECT COUNT(*) FROM best").fetchone()[0]
             status(f"BEST deduped rows = {cnt:,}")
-
 # -------------------- FYE + QUARTERS (Q4 delta) -------------------------
-
 def compute_fye_and_quarters(best_parquet: Path, fye_out: Path, quarters_out: Path):
     with Timer("Compute FYE + quarters_true"):
         with duckdb.connect() as con:
@@ -313,21 +278,16 @@ def compute_fye_and_quarters(best_parquet: Path, fye_out: Path, quarters_out: Pa
             con.execute(f"COPY quarters_true TO {sql_path(quarters_out)} (FORMAT PARQUET, COMPRESSION ZSTD);")
             q_cnt = con.execute("SELECT COUNT(*) FROM quarters_true").fetchone()[0]
             status(f" quarters_true: rows = {q_cnt:,}")
-
 # ---------------------------- SEEDERS -----------------------------------
-
 def dataset_has_files(path: Path) -> bool:
     return any(path.glob("*.parquet")) or any(path.glob("**/*.parquet"))
-
 def seed_reference_dims():
     status("seeding: reference dimensions (idempotent)")
     (STAR / "dim_sector").mkdir(parents=True, exist_ok=True)
     (STAR / "sic_sector_ranges").mkdir(parents=True, exist_ok=True)
     (STAR / "dim_company_profile").mkdir(parents=True, exist_ok=True)
     (STAR / "dim_company_ids").mkdir(parents=True, exist_ok=True)
-
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
     # 1) dim_sector
     if not dataset_has_files(STAR / "dim_sector"):
         with Timer("Seed dim_sector (11 sectors)"):
@@ -352,7 +312,6 @@ def seed_reference_dims():
             status(f" dim_sector rows = {len(dim_sector):,}")
     else:
         status(" dim_sector already present — skipping")
-
     # 2) sic_sector_ranges starter
     if not dataset_has_files(STAR / "sic_sector_ranges"):
         with Timer("Seed sic_sector_ranges (starter mapping)"):
@@ -384,7 +343,6 @@ def seed_reference_dims():
             status(f" sic_sector_ranges rows = {len(sic_ranges_starter):,}")
     else:
         status(" sic_sector_ranges already present — skipping")
-
     # 3) empty shells for optional dims
     if not dataset_has_files(STAR / "dim_company_profile"):
         df = pd.DataFrame([], columns=["company_id","country","state_incorporation","hq_city","hq_state","website"])
@@ -392,16 +350,13 @@ def seed_reference_dims():
         status(" dim_company_profile created (empty)")
     else:
         status(" dim_company_profile present — skipping")
-
     if not dataset_has_files(STAR / "dim_company_ids"):
         df = pd.DataFrame([], columns=["ids_id","company_id","legal_name","lei"])
         pq.write_table(pa.Table.from_pandas(df), STAR / "dim_company_ids" / f"dim_company_ids_empty_{ts}.parquet", compression="zstd")
         status(" dim_company_ids created (empty)")
     else:
         status(" dim_company_ids present — skipping")
-
 # -------------------------- DIM BUILDERS --------------------------------
-
 def build_dim_filing_from_local(out_dir: Path) -> Optional[Path]:
     status("build dim_filing: start")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -453,7 +408,6 @@ def build_dim_filing_from_local(out_dir: Path) -> Optional[Path]:
     pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows)), out_path, compression="zstd")
     status(f" dim_filing write: {out_path.name} ({len(rows):,} rows)")
     return out_path
-
 def append_star(best_parquet: Path, fye_parquet: Path):
     status("append_star: begin building dimensions + facts")
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
