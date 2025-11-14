@@ -274,6 +274,19 @@ CREATE TABLE `fact_holdings` (
 
 ## Configuration
 
+```
+BASE = C:\smilefund_project
+DATA = BASE\data\sec
+FACTS_DIR = data\company_facts
+COMPANY_FACTS_ZIP = data\company_facts.zip
+SUBMISSIONS_DIR = data\submissions
+SUBMISSIONS_ZIP = data\submissions.zip
+
+WAREHOUSE = base\warehouse
+PARQUET_OUT = warehouse\parquet\schema_filled
+DUCKDB_PATH = warehouse\sec_warehouse.duckdb
+```
+
 ## How to Run 
 
 ## Example Queries
