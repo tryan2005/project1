@@ -334,7 +334,17 @@ LIMIT 5;
 
 ## Data Quality & Normalization
 
+- Metric normalization
+- Unit normalization
+- Calendar normalization
+- Deterministic ID generation
+
 ## Planned Extensions
+
+- FDIC bank data integration
+- Ratio metrics (ROE, ROA, Margins)
+- Excel DCF Integration
+- FI Risk Dashboard
 
 ## Conventions
 
