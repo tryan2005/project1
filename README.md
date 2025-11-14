@@ -71,6 +71,13 @@ smilefund_project/
 
 ## Technololgy Stack
 
+```
+'Python 3.x'
+'DuckDB'
+'Parquet (PyArrow)'
+'Pandas'
+Standard Library: 'json', 'zipfile', 'pathlib', 'datetime', 'hashlib'
+
 ## Star Schema
 
 ```
