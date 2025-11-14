@@ -51,6 +51,24 @@ C:\smilefund_project\data\sec\
 
 ## Folder Structure
 
+```
+smilefund_project/
+│
+├─ data/
+│   └─ sec/
+│       ├─ company_facts/
+│       ├─ submissions/
+│       └─ company_tickers.json
+│
+├─ warehouse/
+│   ├─ parquet/
+│   │   └─ schema_filled/
+│   └─ sec_warehouse.duckdb
+│
+└─ src/
+    └─ sec_warehouse_star.py
+```
+
 ## Technololgy Stack
 
 ## Star Schema
