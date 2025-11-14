@@ -1,291 +1,1115 @@
-# build_all_marts_v2.py                                         # Script name (for reference)
-# SEC company_facts (USD) → ALL metrics → Quarters (true) → TTM → Calendar alignment   # High-level pipeline description
-# OUTPUTS (no deletes; writes to marts_v2/):                    # Where outputs are written (no files deleted)
-#   warehouse/parquet/marts_v2/                                 # Root output directory for marts
-#     fact_quarters_true.parquet                                 # Quarters-by-quarter facts (Q1–Q3 from 10-Q, Q4 via 10-K delta)
-#     fact_ttm_aligned.parquet                                   # TTM values aligned to calendar year/quarter
-#     dim_security.parquet                                       # Security/company dimension (CIK, name, ticker)
-#     vw_latest_ttm.parquet                                      # View of most recent TTM per (cik, tag) with ticker
-#     dim_fiscal_year_end.parquet                                # Inferred fiscal year-end month by CIK
-#     _logs/*                                                    # Log area (currently not written to by this script)
+# -*- coding: utf-8 -*-
+"""
+SEC Warehouse — Star v3 (local-only, with built-in seeding + verbose progress)
+- Reads local SEC data at C:\smilefund_project\data\sec\
+- Seeds 11 stock-market sectors (GICS-like) into dim_sector
+- Optional starter SIC → sector ranges
+- Builds: dim_sector, sic_sector_ranges, dim_company, dim_listing,
+          dim_security, dim_metric, dim_unit, dim_calendar, dim_filing,
+          fact_financials (+ empty dim_company_profile, dim_company_ids,
+          dim_subsector, dim_industry)
+"""
 
-import os, json                                                  # Standard libs: os (filesystem helpers), json (parse SEC files)
-from pathlib import Path                                         # Path for path-safe filesystem operations
-from collections import Counter                                  # Counter used to pick most-frequent month for FYE inference
-from typing import Dict, Iterable, Tuple                         # Type hints for clarity
-import pandas as pd                                              # Pandas for dataframes and data wrangling
-# --------- CONFIG ---------
-BASE = Path(r"C:\smilefund_project")                             # Project root directory (Windows raw string)
-FACTS = BASE / r"data\sec\company_facts"                         # Folder containing SEC company_facts JSON files
-DATA  = BASE / r"data\sec"                                       # General SEC data folder (for ticker_map.csv, etc.)
-WARE  = BASE / r"warehouse\parquet"                              # Warehouse/parquet root directory
-MARTS_V2_NAME = "marts_v2"                                       # Name of the subfolder for this version of marts
-MARTS = WARE / MARTS_V2_NAME                                     # Full output path for marts_v2
-LOGS  = MARTS / "_logs"                                          # Logs subdirectory (reserved)
-MARTS.mkdir(parents=True, exist_ok=True)                         # Create marts_v2 directory (no error if it already exists)
-LOGS.mkdir(parents=True, exist_ok=True)                          # Create logs directory (no error if it already exists)
-# --------- CONSTANTS ---------
-USD_UNITS_MULT: Dict[str,int] = {                                # Mapping of SEC unit strings → numeric multipliers
-    "USD":1, "USD$":1,                                           # Unit variants for plain dollars
-    "USDthousands":1_000, "USDThousands":1_000,                  # Unit variants for thousands
-    "USDm":1_000_000, "USDmillions":1_000_000, "USDMillions":1_000_000,  # Unit variants for millions
-}
-Q_MIN, Q_MAX = 70, 110                                           # Acceptable 10-Q duration range in days (approx quarter)
-FY_MIN, FY_MAX = 330, 380                                        # Acceptable 10-K duration range in days (approx fiscal year)
-def parse_dt(s): return pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")  # Parse YYYY-MM-DD → Timestamp (NaT on failure)
-def duration_days(start,end):                                    # (Deprecated stub; kept for clarity comment below)
-    s,e = parse_dt(start), parse_dt(end)                         # Parse start/end strings to timestamps
-    return int((e-e).days)+1 if (pd.notna(s) and pd.notna(e)) else None  # BUGGY: always zero; fixed in function below
-# ----- helpers (fixed) -----
-def duration_days(start, end):                                   # Compute inclusive day-count between start and end dates
-    s, e = parse_dt(start), parse_dt(end)                        # Parse both dates
-    if pd.isna(s) or pd.isna(e): return None                     # If either missing/unparseable → None
-    return int((e - s).days) + 1                                 # Inclusive difference in days
-def is_duration(rec: dict) -> bool:                              # Determine if SEC record is "duration" (has start date)
-    return rec.get("start") is not None                          # Presence of "start" implies duration; otherwise instant
-def month_from_date(s: str):                                     # Extract month (1–12) from "YYYY-MM-DD", else None
+import os, re, gc, json, time, glob, zipfile, hashlib, datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Iterable
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import duckdb
+
+# ------------------------------- CONFIG ---------------------------------
+
+BASE = Path(r"C:\smilefund_project")
+DATA = BASE / "data" / "sec"
+FACTS_DIR = DATA / "company_facts"
+SUBMISSIONS_DIR = DATA / "submissions"
+SUBMISSIONS_ZIP = DATA / "submissions.zip"
+TICKERS_JSON = DATA / "company_tickers.json"
+
+WARE = BASE / "warehouse"
+STAR = WARE / "star_v3"              # new output root
+LOGS = WARE / "_logs"
+TMP_DUCK = WARE / "_duckdb_tmp"
+
+for d in [STAR, LOGS, TMP_DUCK]:
+    d.mkdir(parents=True, exist_ok=True)
+
+DUCK_THREADS = max(1, (os.cpu_count() or 4)//2)
+DUCK_MEM = "8GB"
+
+# ------------------------------- LOGGING --------------------------------
+
+def status(msg: str):
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+class Timer:
+    def __init__(self, label: str):
+        self.label = label
+        self.t0 = None
+
+    def __enter__(self):
+        self.t0 = time.time()
+        status(f"▶ {self.label} — start")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        dt = time.time() - self.t0
+        if exc:
+            status(f"✖ {self.label} — ERROR after {dt:,.1f}s: {exc}")
+        else:
+            status(f"✔ {self.label} — done in {dt:,.1f}s")
+
+
+# ------------------------- DETERMINISTIC IDS ----------------------------
+
+def h64(s: str) -> int:
+    d = hashlib.blake2b(s.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(d, "big", signed=False)
+
+
+def company_id_from_cik(cik: str) -> int:
+    return int(str(int(cik)))  # normalized CIK as int
+
+
+def metric_id_from_tag(xbrl_tag: str) -> int:
+    return h64(f"metric:{xbrl_tag.strip()}")
+
+
+def unit_id_from_code(unit_code: str) -> int:
+    return h64(f"unit:{(unit_code or '').strip()}")
+
+
+def filing_id_from_accession(accession: str) -> int:
+    return h64(f"filing:{(accession or '').strip()}")
+
+
+def listing_id_from_fields(cik: str, ticker: str, exch: str) -> int:
+    key = f"{int(cik)}|{(ticker or '').upper()}|{(exch or '').upper()}"
+    return h64(f"listing:{key}")
+
+
+def security_id_from_fields(cik: str, ticker: str, exch: str, share_class: str) -> int:
+    key = f"{int(cik)}|{(ticker or '').upper()}|{(exch or '').upper()}|{(share_class or '').upper()}"
+    return h64(f"security:{key}")
+
+
+# ---------------------------- UTILITIES ---------------------------------
+
+def set_duckdb(con):
+    con.execute(f"PRAGMA threads={DUCK_THREADS};")
     try:
-        return int(s[5:7]) if s and len(s) >= 7 else None        # Slice characters 5–6 (0-based) if string is long enough
-    except:
-        return None                                              # Any failure → None
-def qn_from_fp(fp: str):                                         # Map SEC fp (Q1,Q2,Q3,Q4,10K delta) → quarter number 1–4
-    return {"Q1":1,"Q2":2,"Q3":3,"Q4":4,"10K delta":4}.get(fp)   # Q4 and 10K delta both map to quarter 4
-def quarter_end_month_from_qn(qn: int, fye_month: int) -> int:   # Quarter end month given quarter number and FYE month
-    return ((int(fye_month) + {4:0,3:-3,2:-6,1:-9}[int(qn)] - 1) % 12) + 1  # Roll back months from FYE to get quarter end
-def calendar_year_from_fy(fy: int, q_end_month: int, fye_month: int) -> int: # Convert FY/quarter-end-month → calendar year
-    return int(fy) if int(q_end_month) <= int(fye_month) else int(fy) - 1    # If quarter end before/equal FYE month, same FY; else prior
-# --------- READERS ---------
-def load_company_file(path: Path) -> Tuple[int, dict]:           # Load a single company_facts JSON file
-    d = json.loads(path.read_text(encoding="utf-8"))             # Read and parse JSON
-    return int(d.get("cik", 0)), d                               # Return (cik, full dict)
-def iter_all_us_gaap_usd(cik: int, data: dict):                  # Yield all USD us-gaap records for a given company
-    facts = data.get("facts", {}).get("us-gaap", {})             # Dive into facts → us-gaap tag dictionary
-    for tag, blk in facts.items():                                # Iterate each XBRL tag and its block
-        for unit, arr in blk.get("units", {}).items():           # Iterate each unit (e.g., USD, USDm) and its array of records
-            if unit not in USD_UNITS_MULT: continue              # Only keep USD-based units we know how to scale
-            mult = USD_UNITS_MULT[unit]                          # Get multiplier for this unit
-            for rec in arr:                                      # Iterate every reported record for this (tag, unit)
-                fp, form, fy, val = rec.get("fp"), rec.get("form"), rec.get("fy"), rec.get("val")  # Extract key fields
-                filed, start, end = rec.get("filed"), rec.get("start"), rec.get("end")             # Extract period metadata
-                if val is None or fy is None or fp is None or form is None:                        # Filter incomplete rows
-                    continue
-                pt = "duration" if is_duration(rec) else "instant"                                  # Period type: duration vs instant
-                if pt == "duration":                                                                # Duration records (have start/end)
-                    d = duration_days(start, end)                                                   # Compute length in days
-                    if fp in ("Q1","Q2","Q3"):                                                      # For Q1–Q3…
-                        if not (form.startswith("10-Q") and d and Q_MIN <= d <= Q_MAX): continue    # Keep only proper 10-Q duration
-                    elif fp == "FY":                                                                # For FY (annual)…
-                        if not (form.startswith("10-K") and d and FY_MIN <= d <= FY_MAX): continue  # Keep only proper 10-K duration
-                    elif fp == "Q4":                                                                # We do not accept Q4 duration directly
-                        continue  # we’ll derive Q4 via 10-K delta                                   # Q4 derived as FY − (Q1+Q2+Q3)
-                else:                                                                               # Instant records (balance sheet, etc.)
-                    if fp not in ("Q1","Q2","Q3","Q4","FY"): continue                               # Only keep quarter/fiscal endpoints
+        con.execute("PRAGMA temp_directory=?", [str(TMP_DUCK)])
+    except Exception:
+        pass
+    con.execute(f"PRAGMA memory_limit='{DUCK_MEM}';")
+    con.execute("SET preserve_insertion_order=false;")
 
-                try: value = float(val) * mult                                                      # Scale numeric value by unit multiplier
-                except: continue                                                                    # Skip if value is non-numeric
-                yield {                                                                             # Yield normalized record
-                    "cik": cik, "tag": tag, "unit": unit,                                           # Entity and unit
-                    "fy": int(fy), "fp": str(fp), "form": str(form),                                # Fiscal year, period, form
-                    "filed": str(filed) if filed else None,                                         # Filed date as string (or None)
-                    "start": start, "end": end,                                                     # Period bounds (None for instant)
-                    "period_type": pt,                                                              # "duration" or "instant"
-                    "value": value,                                                                 # Scaled numeric value
+
+def sql_path(p: Path) -> str:
+    return "'" + str(p).replace("'", "''") + "'"
+
+
+def parquet_exists(dirpath: Path) -> bool:
+    return bool(glob.glob(str(dirpath / "*.parquet"))) or bool(glob.glob(str(dirpath / "**/*.parquet")))
+
+
+def read_json_local(p: Path) -> Any:
+    return json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+
+
+# --------------------------- LOCAL LOADERS ------------------------------
+
+def iter_companyfacts_files() -> Iterable[Path]:
+    if FACTS_DIR.exists():
+        for f in os.scandir(FACTS_DIR):
+            if f.is_file() and f.name.endswith(".json"):
+                yield Path(f.path)
+
+
+def load_submissions_local(cik: int) -> Optional[Dict[str, Any]]:
+    p = SUBMISSIONS_DIR / f"CIK{cik:010d}.json"
+    if p.exists():
+        return read_json_local(p)
+    if SUBMISSIONS_ZIP.exists():
+        with zipfile.ZipFile(SUBMISSIONS_ZIP, "r") as zf:
+            name = f"submissions/CIK{cik:010d}.json"
+            if name in zf.namelist():
+                with zf.open(name) as fh:
+                    return json.loads(fh.read().decode("utf-8", errors="ignore"))
+    return None
+
+
+def load_company_tickers() -> pd.DataFrame:
+    if not TICKERS_JSON.exists():
+        status("note: company_tickers.json not found — listings/security dims may be sparse")
+        return pd.DataFrame(columns=["cik", "ticker", "title", "exchange", "sic"])
+
+    raw = read_json_local(TICKERS_JSON)
+    df = pd.DataFrame(raw)  # SEC file is a list of dicts
+
+    if "cik_str" in df.columns and "cik" not in df.columns:
+        df["cik"] = df["cik_str"]
+
+    for c in ["cik", "ticker", "title", "exchange", "sic"]:
+        if c not in df.columns:
+            df[c] = None
+
+    df["cik"] = pd.to_numeric(df["cik"], errors="coerce").astype("Int64")
+    df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
+    df["exchange"] = df["exchange"].astype(str).str.upper().str.strip()
+    df["sic"] = pd.to_numeric(df["sic"], errors="coerce").astype("Int64")
+
+    status(f"tickers loaded: {len(df):,} rows (unique CIKs: {df['cik'].nunique():,})")
+    return df[["cik", "ticker", "title", "exchange", "sic"]].dropna(subset=["cik"]).drop_duplicates()
+
+
+# ---------------------- BUILD “BEST” FROM LOCAL FACTS -------------------
+
+USD_UNITS_MULT = {
+    "USD": 1,
+    "USD$": 1,
+    "USDthousands": 1_000,
+    "USDThousands": 1_000,
+    "USDm": 1_000_000,
+    "USDmillions": 1_000_000,
+    "USDMillions": 1_000_000,
+}
+
+Q_MIN, Q_MAX = 70, 110
+FY_MIN, FY_MAX = 330, 380
+
+
+def parse_dt(s):
+    return pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")
+
+
+def duration_days(start, end):
+    s, e = parse_dt(start), parse_dt(end)
+    if pd.isna(s) or pd.isna(e):
+        return None
+    return int((e - s).days) + 1
+
+
+def iter_us_gaap_usd_rows(cik: int, cf: dict) -> Iterable[dict]:
+    facts = (cf or {}).get("facts", {}).get("us-gaap", {})
+    for tag, blk in facts.items():
+        for unit, arr in (blk.get("units") or {}).items():
+            mult = USD_UNITS_MULT.get(unit)
+            if not mult:
+                continue
+            for rec in arr:
+                fp, form, fy, val = rec.get("fp"), rec.get("form"), rec.get("fy"), rec.get("val")
+                if val is None or fy is None or fp is None or form is None:
+                    continue
+                ptype = "duration" if rec.get("start") else "instant"
+                if ptype == "duration":
+                    d = duration_days(rec.get("start"), rec.get("end"))
+                    if fp in ("Q1", "Q2", "Q3"):
+                        if not (isinstance(form, str) and form.startswith("10-Q") and d and Q_MIN <= d <= Q_MAX):
+                            continue
+                    elif fp == "FY":
+                        if not (isinstance(form, str) and form.startswith("10-K") and d and FY_MIN <= d <= FY_MAX):
+                            continue
+                    elif fp == "Q4":
+                        # derive later
+                        continue
+                else:
+                    if fp not in ("Q1", "Q2", "Q3", "Q4", "FY"):
+                        continue
+
+                try:
+                    value = float(val) * mult
+                except Exception:
+                    continue
+
+                yield {
+                    "cik": int(cik),
+                    "tag": tag,
+                    "unit": unit,
+                    "fy": int(fy),
+                    "fp": str(fp),
+                    "form": str(form),
+                    "filed": rec.get("filed"),
+                    "start": rec.get("start"),
+                    "end": rec.get("end"),
+                    "period_type": ptype,
+                    "value": value,
                 }
-def choose_best_per_period(df: pd.DataFrame) -> pd.DataFrame:    # Deduplicate competing filings; pick best by form & recency
-    df = df.copy()                                               # Work on a copy to avoid side effects
-    df["filed_dt"] = pd.to_datetime(df["filed"], errors="coerce")# Parse filed date for sorting
-    def form_rank(r):                                            # Assign rank: prefer 10-Q for quarters, 10-K for FY
-        pt, fp, form = r["period_type"], r["fp"], r["form"]      # Pull needed fields
-        if pt == "duration":
-            if fp in ("Q1","Q2","Q3"): return 0 if form.startswith("10-Q") else 1  # 10-Q preferred for Q1–Q3
-            if fp == "FY":             return 0 if form.startswith("10-K") else 1  # 10-K preferred for FY
-            return 1
-        else:
-            if fp in ("Q1","Q2","Q3","Q4"): return 0 if form.startswith("10-Q") else 1  # 10-Q preferred for quarters
-            if fp == "FY":                  return 0 if form.startswith("10-K") else 1  # 10-K preferred for FY
-            return 1
-    df["form_rank"] = df.apply(form_rank, axis=1)                # Compute preferred form rank per row
-    df = df.sort_values(                                         # Sort by entity/tag/period, then pref, then filed date
-        ["cik","tag","fy","fp","period_type","form_rank","filed_dt"],
-        ascending=[True,True,True,True,True,True,True]
+
+
+def build_best_parquet(out_parquet: Path) -> None:
+    status("collect: scanning company_facts/*.json")
+    schema = pa.schema(
+        [
+            ("cik", pa.int64()),
+            ("tag", pa.string()),
+            ("unit", pa.string()),
+            ("fy", pa.int32()),
+            ("fp", pa.string()),
+            ("form", pa.string()),
+            ("filed", pa.string()),
+            ("start", pa.string()),
+            ("end", pa.string()),
+            ("period_type", pa.string()),
+            ("value", pa.float64()),
+        ]
     )
-    return df.drop_duplicates(["cik","tag","fy","fp","period_type"], keep="first") \  # Keep the top-ranked row per key
-             .drop(columns=["form_rank"])                                             # Drop helper column
-# --------- QUARTERS (TRUE) ---------
-def build_quarters_true(best: pd.DataFrame) -> pd.DataFrame:     # Construct true quarter series: Q1–Q3 from 10-Q; Q4 via 10-K delta
-    out = []                                                     # Collector for partial dataframes
-    # duration: Q1..Q3 from 10-Q; Q4 as 10-K delta
-    dur = best[best["period_type"]=="duration"]                  # Filter duration-type facts
-    if not dur.empty:                                            # If we have any duration rows
-        q = dur[dur["fp"].isin(["Q1","Q2","Q3"])][["cik","tag","fy","fp","value"]]     # Keep Q1–Q3 as-is
-        fy = dur[dur["fp"]=="FY"][["cik","tag","fy","value"]].rename(columns={"value":"fy_value"})  # FY totals per tag
-        qsum = (q.groupby(["cik","tag","fy"], as_index=False)["value"].sum()            # Sum Q1–Q3 values
-                  .rename(columns={"value":"q123"}))                                    # Name the sum column
-        m = fy.merge(qsum, on=["cik","tag","fy"], how="inner")                          # Join FY with Q1–Q3 sums
-        m["delta"] = m["fy_value"] - m["q123"]                                          # Q4 (delta) = FY − (Q1+Q2+Q3)
-        out.append(q.assign(period_type="duration"))                                    # Append Q1–Q3 duration rows
-        out.append(m[["cik","tag","fy","delta"]].rename(columns={"delta":"value"})      # Append Q4 as "10K delta"
-                   .assign(fp="10K delta", period_type="duration"))
-    # instant: Q1..Q4 (prefer 10-Q). If only FY exists, map FY→Q4 (for that year only)
-    ins = best[best["period_type"]=="instant"]                    # Filter instant-type facts
-    if not ins.empty:                                             # If any instant rows
-        iq = ins[ins["fp"].isin(["Q1","Q2","Q3","Q4"])][["cik","tag","fy","fp","value"]]  # Keep quarterly instants
-        out.append(iq.assign(period_type="instant"))              # Append them
-        fy_ins = ins[ins["fp"]=="FY"][["cik","tag","fy","value"]] # FY instant values (some tags report FY instant)
-        if not fy_ins.empty:                                      # If we have FY instants
-            have_q4 = set(iq[iq["fp"]=="Q4"][["cik","tag","fy"]].apply(tuple, axis=1))   # Build set of (cik,tag,fy) that already have Q4
-            map_df = fy_ins[~fy_ins.apply(lambda r: (r["cik"],r["tag"],r["fy"]) in have_q4, axis=1)]  # FY rows lacking a Q4
-            if not map_df.empty:
-                out.append(map_df.assign(fp="Q4", period_type="instant"))  # Treat FY instant as Q4 if no Q4 present
-    if not out:                                                   # If we collected nothing…
-        return pd.DataFrame(columns=["cik","tag","fy","fp","qn","value","period_type"])  # Return empty with expected columns
-    rows = pd.concat(out, ignore_index=True)                      # Combine pieces into a single dataframe
-    rows["qn"] = rows["fp"].map(qn_from_fp).astype("Int64")       # Map fp → quarter number (nullable integer)
-    rows = rows.dropna(subset=["qn"]).copy()                      # Drop rows without a valid quarter number
-    return rows[["cik","tag","fy","fp","qn","value","period_type"]] \  # Return tidy columns
-              .sort_values(["cik","tag","fy","qn"])               # Sort by entity/tag/year/quarter
-# --------- TTM ---------
-def build_ttm(qu: pd.DataFrame) -> pd.DataFrame:                  # Compute trailing-twelve-month values per tag/entity
-    if qu.empty: return pd.DataFrame()                            # If no quarters available, return empty
-    qu = qu.sort_values(["cik","tag","fy","qn"]).copy()           # Ensure chronological ordering within groups
-    def per_group(g):                                             # Apply per (cik, tag, period_type) group
-        g = g.sort_values(["fy","qn"])                            # Sort by fiscal year then quarter
-        if g["period_type"].iloc[0] == "duration":                # For duration series…
-            g["TTM_value"] = g["value"].rolling(4, min_periods=4).sum()  # TTM = rolling 4-quarter sum
-        else:                                                     # For instant series…
-            g["TTM_value"] = g["value"]                           # TTM identity (common for stock measures)
-        return g
-    ttm = qu.groupby(["cik","tag","period_type"], group_keys=False).apply(per_group)  # Compute TTM per group
-    return ttm.dropna(subset=["TTM_value"])                       # Keep rows where a full 4-quarter TTM exists
-# --------- FYE & alignment ---------
-def infer_fye_months() -> pd.DataFrame:                           # Infer each company's fiscal year-end month from FY records
-    files = list(FACTS.glob("*.json"))                            # Enumerate all company_facts JSON files
-    out = []                                                      # Collector for (cik, fye_month)
-    for i, p in enumerate(files, 1):                              # Iterate with progress index
-        try:
-            _, d = load_company_file(p)                           # Load JSON dict
-            facts = d.get("facts", {}).get("us-gaap", {})         # Navigate to us-gaap tags
-            months = []                                           # Collector for FY end months seen in records
-            for _, blk in facts.items():                          # For each tag block
-                for _, arr in blk.get("units", {}).items():       # For each unit's record array
-                    for rec in arr:                               # For each record
-                        if rec.get("fp") == "FY":                 # Only FY rows (annual)
-                            m = month_from_date(rec.get("end"))   # Extract month from period end date
-                            if m: months.append(m)                # Collect month if valid
-            if months:                                            # If any months were found
-                from collections import Counter                   # (Local import okay; already imported above)
-                c = Counter(months)                               # Count frequency of months
-                out.append((int(d.get("cik",0)), max(c.items(), key=lambda kv: (kv[1], kv[0]))[0]))  # Pick most common (tie → larger month)
-        except: pass                                              # Ignore any file/parse errors and continue
-        if i % 2000 == 0:                                         # Progress heartbeat every 2000 companies
-            print(f"inferred FYE for {i}/{len(files)} companies")
-    dim = pd.DataFrame(out, columns=["cik","fye_month"]).drop_duplicates("cik")  # Build dimension with unique CIK rows
-    dim["fiscal_year_start_month"] = ((dim["fye_month"].fillna(12).astype("Int64") % 12) + 1).astype("Int64")  # Derive start month
-    dim.to_parquet(MARTS / "dim_fiscal_year_end.parquet")         # Persist the FYE dimension
-    return dim                                                    # Return dataframe for downstream joins
-def align_to_calendar(ttm: pd.DataFrame, dim_fye: pd.DataFrame) -> pd.DataFrame:  # Map TTM rows to calendar year/quarter
-    a = ttm.merge(dim_fye, on="cik", how="left")                  # Join FYE month onto TTM rows by CIK
-    mask = a["fye_month"].notna() & a["qn"].notna()               # Only rows with known FYE and quarter number can be aligned
-    end_m, cal_y, cal_q = [], [], []                              # Buffers for computed quarter end month/year/quarter
-    for fy, qn, fye in a.loc[mask, ["fy","qn","fye_month"]].itertuples(index=False):  # Iterate needed fields for alignment
-        em = quarter_end_month_from_qn(int(qn), int(fye))         # Compute quarter end month for this qn/fye
-        end_m.append(em)                                          # Collect end month
-        cal_y.append(calendar_year_from_fy(int(fy), em, int(fye)))# Compute calendar year associated with this quarter
-        cal_q.append((em-1)//3 + 1)                               # Convert month → calendar quarter 1–4
-    idx = a.index[mask]                                           # Index positions where we computed alignment
-    a.loc[idx, "quarter_end_month"] = end_m                       # Write quarter end month
-    a.loc[idx, "calendar_year"]     = cal_y                       # Write calendar year
-    a.loc[idx, "calendar_quarter"]  = cal_q                       # Write calendar quarter
-    return a                                                      # Return aligned dataframe
-# --------- dim_security + ticker map ---------
-def build_dim_security() -> pd.DataFrame:                         # Build security/company dimension from company_facts + optional map
-    rows = []                                                     # Collect raw rows
-    files = list(FACTS.glob("*.json"))                            # Enumerate all company facts files
-    for i, p in enumerate(files, 1):                              # Iterate with progress
-        try:
-            d = json.loads(p.read_text(encoding="utf-8"))         # Read file content and parse JSON
-            cik = int(d.get("cik", 0))                            # Extract CIK
-            name = d.get("entityName") or ""                      # Extract company/entity name
-            ticker = d.get("ticker") or d.get("tickers")          # Extract ticker (single or list)
-            if isinstance(ticker, list) and ticker: ticker = str(ticker[0])  # Normalize to a single string if list
-            rows.append({"cik": cik, "company_name": name, "ticker": ticker})  # Append base row
-        except: pass                                              # Ignore malformed files
-        if i % 2000 == 0: print(f"dim_security progress {i}/{len(files)}")     # Progress heartbeat
-    dim = pd.DataFrame(rows).drop_duplicates("cik")               # Deduplicate by CIK
-    dim["cik"] = pd.to_numeric(dim["cik"], errors="coerce").astype("Int64")    # Ensure nullable integer CIK type
-    dim["ticker"] = (dim["ticker"].astype(str).str.upper().str.strip())        # Uppercase/trim tickers
-    dim.loc[dim["ticker"].isin(["NONE","NAN","<NA>",""]), "ticker"] = pd.NA    # Normalize invalid tickers to NA
-    dim["company_name"] = (dim["company_name"].astype(str)                      # Clean up company names
-                           .str.replace(r"[^A-Za-z0-9 &\.-]+"," ",regex=True)
-                           .str.replace(r"\s+"," ",regex=True)
-                           .str.strip())
-    # merge your ticker_map.csv if present
-    map_csv = DATA / "ticker_map.csv"                              # Expected path of user-provided CIK→ticker map
-    if map_csv.exists():                                           # If a map file exists…
-        tm = pd.read_csv(map_csv)                                  # Read the CSV
-        tm.columns = [c.strip().lower() for c in tm.columns]       # Normalize column names (lowercase, trimmed)
-        if "cik" in tm.columns and "ticker" in tm.columns:         # Require columns: cik, ticker
-            tm["cik"] = pd.to_numeric(tm["cik"], errors="coerce").astype("Int64")        # Normalize CIK type
-            tm["ticker"] = (tm["ticker"].astype(str).str.upper().str.strip()             # Normalize tickers
-                            .replace("-", ".", regex=False))                              # Map '-' to '.' (ticker convention)
-            tm = tm.dropna(subset=["cik"]).drop_duplicates("cik", keep="first")          # One row per CIK
-            dim = dim.merge(tm[["cik","ticker"]], on="cik", how="left", suffixes=("","_map"))  # Left-join map onto base
-            dim["ticker"] = dim["ticker_map"].combine_first(dim["ticker"])               # Prefer mapped ticker if present
-            dim.drop(columns=["ticker_map"], inplace=True, errors="ignore")               # Remove helper column
-            print(f"merged ticker_map.csv with {len(tm):,} rows")                      # Log merge result
-        else:
-            print("ticker_map.csv missing 'cik' or 'ticker' — skipped merge")         # Warn about bad schema
+
+    with Timer("Build BEST parquet (streamed)"):
+        writer = pq.ParquetWriter(out_parquet, schema, compression="zstd")
+        nrows, nfiles = 0, 0
+
+        for f in iter_companyfacts_files():
+            nfiles += 1
+            try:
+                cf = read_json_local(f)
+                cik = int(cf.get("cik", 0))
+                rows = list(iter_us_gaap_usd_rows(cik, cf))
+                if rows:
+                    tbl = pa.Table.from_pylist(rows, schema=schema)
+                    writer.write_table(tbl)
+                    nrows += tbl.num_rows
+            except Exception as e:
+                status(f"warn: {f.name} → {e}")
+
+            if nfiles % 200 == 0:
+                status(f"… BEST progress: files={nfiles:,}, rows≈{nrows:,}")
+
+        writer.close()
+        status(f"BEST (pre-dedupe) total rows ≈ {nrows:,}")
+
+    with Timer("Deduplicate BEST to earliest filed"):
+        with duckdb.connect() as con:
+            set_duckdb(con)
+            con.execute(
+                f"CREATE OR REPLACE VIEW raw AS SELECT * FROM read_parquet({sql_path(out_parquet)});"
+            )
+            tmp = out_parquet.with_name("_best_tmp.parquet")
+            con.execute(
+                """
+                CREATE TABLE best AS
+                WITH ranked AS (
+                  SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY cik, tag, fy, fp, period_type
+                    ORDER BY filed ASC NULLS LAST
+                  ) rn
+                  FROM raw
+                )
+                SELECT cik, tag, unit, fy, fp, form, filed, start, "end", period_type, value
+                FROM ranked WHERE rn=1;
+            """
+            )
+            con.execute(
+                f"COPY best TO {sql_path(tmp)} (FORMAT PARQUET, COMPRESSION ZSTD);"
+            )
+            out_parquet.unlink(missing_ok=True)
+            tmp.replace(out_parquet)
+            cnt = con.execute("SELECT COUNT(*) FROM best").fetchone()[0]
+            status(f"BEST deduped rows = {cnt:,}")
+
+
+# -------------------- FYE + QUARTERS (Q4 delta) -------------------------
+
+def compute_fye_and_quarters(best_parquet: Path, fye_out: Path, quarters_out: Path):
+    with Timer("Compute FYE + quarters_true"):
+        with duckdb.connect() as con:
+            set_duckdb(con)
+            con.execute(
+                f"CREATE OR REPLACE VIEW best AS SELECT * FROM read_parquet({sql_path(best_parquet)});"
+            )
+
+            status(" FYE: deriving fiscal year-end month per CIK")
+            con.execute(
+                """
+                CREATE OR REPLACE TABLE dim_fiscal_year_end AS
+                WITH fy AS (
+                  SELECT cik, TRY_CAST("end" AS DATE) AS end_dt
+                  FROM best
+                  WHERE period_type='duration' AND fp='FY' AND "end" IS NOT NULL
+                ),
+                months AS (
+                  SELECT cik, EXTRACT(MONTH FROM end_dt)::INT AS fye_month, COUNT(*) cnt
+                  FROM fy WHERE end_dt IS NOT NULL
+                  GROUP BY 1,2
+                ),
+                ranked AS (
+                  SELECT *, ROW_NUMBER() OVER (PARTITION BY cik ORDER BY cnt DESC, fye_month DESC) rn
+                  FROM months
+                )
+                SELECT cik, fye_month, ((fye_month % 12)+1)::INT AS fiscal_year_start_month
+                FROM ranked WHERE rn=1;
+            """
+            )
+            con.execute(
+                f"COPY dim_fiscal_year_end TO {sql_path(fye_out)} (FORMAT PARQUET, COMPRESSION ZSTD);"
+            )
+            fy_cnt = con.execute("SELECT COUNT(*) FROM dim_fiscal_year_end").fetchone()[0]
+            status(f" FYE: rows = {fy_cnt:,}")
+
+            status(" quarters_true: building Q1–Q4 for duration + instant metrics")
+            con.execute(
+                """
+                CREATE OR REPLACE TABLE quarters_true AS
+                WITH dur_q AS (
+                  SELECT cik, tag, fy, fp,
+                         CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 END AS qn,
+                         value, period_type, unit, form, filed, "end"
+                  FROM best WHERE period_type='duration' AND fp IN ('Q1','Q2','Q3')
+                ),
+                dur_fy AS (
+                  SELECT cik, tag, fy, value fy_value
+                  FROM best
+                  WHERE period_type='duration' AND fp='FY'
+                ),
+                dur_qsum AS (
+                  SELECT cik, tag, fy, SUM(value) q123
+                  FROM dur_q
+                  GROUP BY 1,2,3
+                ),
+                dur_q4 AS (
+                  SELECT f.cik, f.tag, f.fy, 'Q4' fp, 4 qn,
+                         (f.fy_value - q.q123) value, 'duration' period_type,
+                         NULL unit, NULL form, NULL filed, NULL "end"
+                  FROM dur_fy f
+                  JOIN dur_qsum q USING(cik, tag, fy)
+                ),
+                ins_q AS (
+                  SELECT cik, tag, fy, fp,
+                         CASE fp
+                           WHEN 'Q1' THEN 1
+                           WHEN 'Q2' THEN 2
+                           WHEN 'Q3' THEN 3
+                           WHEN 'Q4' THEN 4
+                         END qn,
+                         value, period_type, unit, form, filed, "end"
+                  FROM best
+                  WHERE period_type='instant' AND fp IN ('Q1','Q2','Q3','Q4')
+                ),
+                ins_fy AS (
+                  SELECT cik, tag, fy, value
+                  FROM best
+                  WHERE period_type='instant' AND fp='FY'
+                ),
+                have_q4 AS (
+                  SELECT DISTINCT cik, tag, fy
+                  FROM ins_q
+                  WHERE fp='Q4'
+                ),
+                ins_fy_to_q4 AS (
+                  SELECT f.cik, f.tag, f.fy, 'Q4' fp, 4 qn, f.value,
+                         'instant' period_type,
+                         NULL unit, NULL form, NULL filed, NULL "end"
+                  FROM ins_fy f
+                  LEFT JOIN have_q4 h USING(cik, tag, fy)
+                  WHERE h.cik IS NULL
+                )
+                SELECT * FROM dur_q
+                UNION ALL
+                SELECT * FROM dur_q4
+                UNION ALL
+                SELECT * FROM ins_q
+                UNION ALL
+                SELECT * FROM ins_fy_to_q4;
+            """
+            )
+            con.execute(
+                f"COPY quarters_true TO {sql_path(quarters_out)} (FORMAT PARQUET, COMPRESSION ZSTD);"
+            )
+            q_cnt = con.execute("SELECT COUNT(*) FROM quarters_true").fetchone()[0]
+            status(f" quarters_true: rows = {q_cnt:,}")
+
+
+# ---------------------------- SEEDERS -----------------------------------
+
+def dataset_has_files(path: Path) -> bool:
+    return any(path.glob("*.parquet")) or any(path.glob("**/*.parquet"))
+
+
+def seed_reference_dims():
+    status("seeding: reference dimensions (idempotent)")
+    (STAR / "dim_sector").mkdir(parents=True, exist_ok=True)
+    (STAR / "sic_sector_ranges").mkdir(parents=True, exist_ok=True)
+    (STAR / "dim_company_profile").mkdir(parents=True, exist_ok=True)
+    (STAR / "dim_company_ids").mkdir(parents=True, exist_ok=True)
+    (STAR / "dim_subsector").mkdir(parents=True, exist_ok=True)
+    (STAR / "dim_industry").mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # 1) dim_sector
+    if not dataset_has_files(STAR / "dim_sector"):
+        with Timer("Seed dim_sector (11 sectors)"):
+            dim_sector = pd.DataFrame(
+                [
+                    (10, "Energy", "10"),
+                    (15, "Materials", "15"),
+                    (20, "Industrials", "20"),
+                    (25, "Consumer Discretionary", "25"),
+                    (30, "Consumer Staples", "30"),
+                    (35, "Health Care", "35"),
+                    (40, "Financials", "40"),
+                    (45, "Information Technology", "45"),
+                    (50, "Communication Services", "50"),
+                    (55, "Utilities", "55"),
+                    (60, "Real Estate", "60"),
+                ],
+                columns=["sector_id", "sector_name", "sector_code"],
+            )
+            pq.write_table(
+                pa.Table.from_pandas(dim_sector),
+                STAR / "dim_sector" / f"dim_sector_seed_{ts}.parquet",
+                compression="zstd",
+            )
+            status(f" dim_sector rows = {len(dim_sector):,}")
     else:
-        print("ticker_map.csv not found — dim_security uses embedded tickers only")    # Inform if no map present
-    dim.to_parquet(MARTS / "dim_security.parquet")                 # Persist dim_security
-    return dim                                                     # Return for downstream joins/views
-# --------- MAIN ---------
-def main():                                                       # Orchestrates the full build pipeline
-    files = list(FACTS.glob("*.json"))                            # Enumerate input company_facts files
-    if not files:                                                 # If none found…
-        raise RuntimeError(f"No company_facts JSON files in {FACTS}")  # Hard fail with message
-    # A) parse all USD us-gaap rows
-    raw_rows = []                                                 # Collector for normalized raw records
-    for i, p in enumerate(files, 1):                              # Iterate files with progress index
+        status(" dim_sector already present — skipping")
+
+    # 2) sic_sector_ranges starter
+    if not dataset_has_files(STAR / "sic_sector_ranges"):
+        with Timer("Seed sic_sector_ranges (starter mapping)"):
+            sic_ranges_starter = pd.DataFrame(
+                [
+                    (1, 100, 999, 20, "SIC Division A → Industrials (starter)"),
+                    (2, 1000, 1499, 10, "Mining → Energy (starter)"),
+                    (3, 1500, 1799, 20, "Construction → Industrials (starter)"),
+                    (4, 2000, 3999, 15, "Manufacturing → Materials (starter)"),
+                    (5, 4000, 4299, 20, "Rail/Truck/Pipeline → Industrials (starter)"),
+                    (6, 4300, 4499, 50, "Communications → Comm Services (starter)"),
+                    (7, 4500, 4799, 20, "Air/Water Transport → Industrials (starter)"),
+                    (8, 4800, 4999, 55, "Electric/Gas/Sanitary → Utilities (starter)"),
+                    (9, 5000, 5199, 20, "Wholesale → Industrials (starter)"),
+                    (10, 5200, 5599, 30, "Retail (staples-lean) → Consumer Staples (starter)"),
+                    (11, 5600, 5999, 25, "Retail (discretionary) → Consumer Discretionary (starter)"),
+                    (12, 6000, 6799, 40, "Finance/Insurance/RE (legacy) → Financials (good)"),
+                    (13, 7000, 7399, 45, "Business services → Information Technology (starter)"),
+                    (14, 7400, 7999, 25, "Consumer services → Consumer Discretionary (starter)"),
+                    (15, 8000, 8099, 35, "Health services → Health Care (good)"),
+                    (16, 8100, 8999, 50, "Other services → Communication Services (placeholder)"),
+                    (17, 9100, 9729, 55, "Public Administration → Utilities (placeholder)"),
+                    (18, 9900, 9999, 60, "Nonclassifiable → Real Estate (placeholder)"),
+                ],
+                columns=["range_id", "sic_min", "sic_max", "sector_id", "notes"],
+            )
+            pq.write_table(
+                pa.Table.from_pandas(sic_ranges_starter),
+                STAR / "sic_sector_ranges" / f"sic_sector_ranges_seed_{ts}.parquet",
+                compression="zstd",
+            )
+            status(f" sic_sector_ranges rows = {len(sic_ranges_starter):,}")
+    else:
+        status(" sic_sector_ranges already present — skipping")
+
+    # 3) empty shells for optional dims
+    if not dataset_has_files(STAR / "dim_company_profile"):
+        df = pd.DataFrame(
+            [],
+            columns=[
+                "company_id",
+                "country",
+                "state_incorporation",
+                "hq_city",
+                "hq_state",
+                "website",
+            ],
+        )
+        pq.write_table(
+            pa.Table.from_pandas(df),
+            STAR / "dim_company_profile" / f"dim_company_profile_empty_{ts}.parquet",
+            compression="zstd",
+        )
+        status(" dim_company_profile created (empty)")
+    else:
+        status(" dim_company_profile present — skipping")
+
+    if not dataset_has_files(STAR / "dim_company_ids"):
+        df = pd.DataFrame([], columns=["ids_id", "company_id", "legal_name", "lei"])
+        pq.write_table(
+            pa.Table.from_pandas(df),
+            STAR / "dim_company_ids" / f"dim_company_ids_empty_{ts}.parquet",
+            compression="zstd",
+        )
+        status(" dim_company_ids created (empty)")
+    else:
+        status(" dim_company_ids present — skipping")
+
+    # 4) empty dim_subsector shell (to be populated later)
+    if not dataset_has_files(STAR / "dim_subsector"):
+        df = pd.DataFrame(
+            [],
+            columns=[
+                "subsector_id",
+                "subsector_name",
+                "subsector_code",
+                "sector_id",
+                "description",
+                "is_active",
+            ],
+        )
+        pq.write_table(
+            pa.Table.from_pandas(df),
+            STAR / "dim_subsector" / f"dim_subsector_empty_{ts}.parquet",
+            compression="zstd",
+        )
+        status(" dim_subsector created (empty)")
+    else:
+        status(" dim_subsector present — skipping")
+
+    # 5) empty dim_industry shell (to be populated later)
+    if not dataset_has_files(STAR / "dim_industry"):
+        df = pd.DataFrame(
+            [],
+            columns=[
+                "industry_id",
+                "sic_code",
+                "industry_title",
+                "subsector_id",
+                "sector_id",
+                "notes",
+                "is_active",
+            ],
+        )
+        pq.write_table(
+            pa.Table.from_pandas(df),
+            STAR / "dim_industry" / f"dim_industry_empty_{ts}.parquet",
+            compression="zstd",
+        )
+        status(" dim_industry created (empty)")
+    else:
+        status(" dim_industry present — skipping")
+
+
+# -------------------------- DIM BUILDERS --------------------------------
+
+def build_dim_filing_from_local(out_dir: Path) -> Optional[Path]:
+    status("build dim_filing: start")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows: List[Dict[str, Any]] = []
+
+    # limit scope to CIKs present in company_facts
+    ciks = set()
+    for f in iter_companyfacts_files():
         try:
-            cik, data = load_company_file(p)                      # Load (cik, dict)
-            raw_rows.extend(iter_all_us_gaap_usd(cik, data))      # Append all eligible records from this company
-        except: pass                                              # Ignore individual file errors to keep going
-        if i % 2000 == 0: print(f"parsed {i}/{len(files)} companies")  # Progress heartbeat
-    raw = pd.DataFrame(raw_rows)                                  # Build dataframe from collected records
-    if raw.empty:                                                 # If nothing parsed…
-        raise RuntimeError("No USD us-gaap facts parsed.")        # Fail fast—likely wrong input path or data
-    # B) choose “best” per (cik, tag, fy, fp, period_type)
-    best = choose_best_per_period(raw)                            # Deduplicate by picking preferred filing for each period
-    # C) quarters (true)
-    qu = build_quarters_true(best)                                # Build true quarters (incl. Q4 from 10-K delta)
-    (MARTS / "fact_quarters_true.parquet").write_bytes(b"") if False else None  # No-op placeholder (kept from prior pattern)
-    qu.to_parquet(MARTS / "fact_quarters_true.parquet")           # Persist quarters table
-    # D) TTM
-    ttm = build_ttm(qu)                                           # Compute TTM values over quarter series
-    if ttm.empty:                                                 # If no TTM could be formed…
-        raise RuntimeError("No TTM rows produced.")               # Fail (upstream data likely insufficient)
-    # E) FYE → calendar alignment
-    dim_fye = infer_fye_months()                                  # Infer FYE month per company (and persist)
-    ttm_aligned = align_to_calendar(ttm, dim_fye)                 # Map TTM rows to calendar year/quarter
-    ttm_aligned.to_parquet(MARTS / "fact_ttm_aligned.parquet")    # Persist aligned TTM
-    # F) dim_security (+ ticker_map merge)
-    dim_sec = build_dim_security()                                # Build and persist security dimension (with optional map)
-    # G) latest TTM per (cik, tag) + ticker
-    a = ttm_aligned.dropna(subset=["calendar_year","qn"]).copy()  # Keep rows with valid calendar alignment
-    a["calendar_year"] = a["calendar_year"].astype(int)           # Normalize calendar year to int
-    a["qn"] = a["qn"].astype(int)                                 # Normalize quarter number to int
-    last = (a.sort_values(["cik","tag","calendar_year","qn"])     # Sort so that group .last() picks most recent quarter
-              .groupby(["cik","tag"], as_index=False)             # Group by company & tag
-              .last()[["cik","tag","calendar_year","calendar_quarter","period_type","TTM_value"]]  # Take last row per group
-              .rename(columns={"calendar_year":"ttm_cal_year",    # Rename columns for clarity in view
-                               "calendar_quarter":"ttm_cal_quarter",
-                               "TTM_value":"ttm_value"}))
-    vw = (last.merge(dim_sec, on="cik", how="left")               # Join in ticker and company name
-               [["cik","ticker","company_name","tag","period_type","ttm_cal_year","ttm_cal_quarter","ttm_value"]]  # Select/order cols
-               .sort_values("ttm_value", ascending=False))        # Order by value descending for convenience
-    vw.to_parquet(MARTS / "vw_latest_ttm.parquet")                # Persist the "view" parquet
-    print("\nTop 10 latest TTM (any tag):")                       # Friendly console output for quick sanity check
-    print(vw.head(10))                                            # Display top 10 rows
-if __name__ == "__main__":                                       # Standard module guard (run main only if executed as script)
-    main()                                                        # Execute the pipeline
+            d = read_json_local(f)
+            ciks.add(int(d.get("cik", 0)))
+        except:
+            pass
+
+    status(f" dim_filing: CIK universe size = {len(ciks):,}")
+
+    with Timer("Extract submissions → dim_filing rows"):
+        for idx, cik in enumerate(sorted(ciks), 1):
+            s = load_submissions_local(cik)
+            if not s:
+                continue
+
+            recent = (s.get("filings") or {}).get("recent") or {}
+            forms = recent.get("form") or []
+            filingDates = recent.get("filingDate") or []
+            acceptedDates = recent.get("acceptanceDateTime") or []
+            accession = recent.get("accessionNumber") or []
+            periodEnds = recent.get("periodOfReport") or []
+
+            for j in range(len(forms)):
+                form = forms[j]
+                fd = filingDates[j] if j < len(filingDates) else None
+                ad = acceptedDates[j] if j < len(acceptedDates) else None
+                an = accession[j] if j < len(accession) else None
+                pe = periodEnds[j] if j < len(periodEnds) else None
+
+                if not an or not form or not fd:
+                    continue
+
+                an_nodash = re.sub(r"[^0-9]", "", an)
+                url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{an_nodash}/"
+
+                rows.append(
+                    {
+                        "filing_id": filing_id_from_accession(an),
+                        "form_type": form,
+                        "filing_date": fd,
+                        "accepted_date": (ad[:10] if isinstance(ad, str) and len(ad) >= 10 else None),
+                        "period_end_date": pe,
+                        "accession_number": an,
+                        "filing_url": url,
+                    }
+                )
+
+            if idx % 250 == 0:
+                status(f" … dim_filing progress: {idx:,}/{len(ciks):,} CIKs, rows={len(rows):,}")
+
+    if not rows:
+        status(" dim_filing: no rows produced")
+        return None
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = out_dir / f"dim_filing_{ts}.parquet"
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows)), out_path, compression="zstd")
+    status(f" dim_filing write: {out_path.name} ({len(rows):,} rows)")
+    return out_path
+
+
+def append_star(best_parquet: Path, fye_parquet: Path):
+    status("append_star: begin building dimensions + facts")
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for sub in [
+        "dim_sector",
+        "sic_sector_ranges",
+        "dim_company",
+        "dim_company_profile",
+        "dim_company_ids",
+        "dim_listing",
+        "dim_security",
+        "dim_metric",
+        "dim_unit",
+        "dim_calendar",
+        "dim_filing",
+        "fact_financials",
+        "dim_subsector",
+        "dim_industry",
+    ]:
+        (STAR / sub).mkdir(parents=True, exist_ok=True)
+
+    tick = load_company_tickers()
+
+    with duckdb.connect() as con:
+        set_duckdb(con)
+        con.execute(f"CREATE OR REPLACE VIEW best AS SELECT * FROM read_parquet({sql_path(best_parquet)});")
+        con.execute(f"CREATE OR REPLACE VIEW fye  AS SELECT * FROM read_parquet({sql_path(fye_parquet)});")
+
+        # ---------------- dim_company ----------------
+        with Timer("Build dim_company"):
+            rows: List[Dict[str, Any]] = []
+            files_count = 0
+
+            for f in iter_companyfacts_files():
+                files_count += 1
+                try:
+                    d = read_json_local(f)
+                    cik = int(d.get("cik", 0))
+                    name = (d.get("entityName") or "").strip()
+                    rows.append(
+                        {
+                            "company_id": company_id_from_cik(str(cik)),
+                            "cik": int(cik),
+                            "name": name,
+                        }
+                    )
+                except Exception as e:
+                    status(f"  warn companyfacts {f.name}: {e}")
+
+                if files_count % 500 == 0:
+                    status(f"  … dim_company scan progress: {files_count:,} files")
+
+            df_company = pd.DataFrame(rows).drop_duplicates("company_id")
+            status(f"  dim_company seeds from facts: {len(df_company):,} companies")
+
+            if not tick.empty:
+                df_company = df_company.merge(
+                    tick.rename(columns={"title": "title_from_tickers"})[["cik", "ticker", "exchange", "sic"]],
+                    on="cik",
+                    how="left",
+                )
+                status("  merged tickers onto companies")
+
+            # fiscal year-end month
+            with duckdb.connect() as c2:
+                set_duckdb(c2)
+                c2.register("co", df_company)
+                c2.execute(f"CREATE OR REPLACE VIEW fye AS SELECT * FROM read_parquet({sql_path(fye_parquet)});")
+                df_company = c2.execute(
+                    """
+                    SELECT
+                        co.*,
+                        COALESCE(f.fye_month, 12)::INT AS fiscal_year_end_month,
+                        NULL::INT AS fiscal_year_end_day
+                    FROM co
+                    LEFT JOIN f ON f.cik = co.company_id
+                """
+                ).fetch_df()
+            status("  fye joined")
+
+            # sector via sic_sector_ranges
+            with duckdb.connect() as c3:
+                set_duckdb(c3)
+                if parquet_exists(STAR / "sic_sector_ranges"):
+                    c3.execute(
+                        f"CREATE OR REPLACE VIEW ranges AS SELECT * FROM read_parquet('{(STAR / 'sic_sector_ranges')}/*.parquet');"
+                    )
+                else:
+                    c3.execute(
+                        """
+                        CREATE OR REPLACE VIEW ranges AS
+                        SELECT
+                            CAST(NULL AS INT) range_id,
+                            CAST(NULL AS INT) sic_min,
+                            CAST(NULL AS INT) sic_max,
+                            CAST(NULL AS INT) sector_id,
+                            CAST(NULL AS VARCHAR) notes
+                        WHERE FALSE;
+                        """
+                    )
+
+                c3.register("co", df_company)
+                df_company = c3.execute(
+                    """
+                    SELECT
+                        co.*,
+                        r.sector_id
+                    FROM co
+                    LEFT JOIN ranges r
+                      ON co.sic IS NOT NULL
+                     AND r.sic_min IS NOT NULL
+                     AND r.sic_max IS NOT NULL
+                     AND co.sic BETWEEN r.sic_min AND r.sic_max
+                """
+                ).fetch_df()
+            status("  sector mapped via SIC ranges")
+
+            out = STAR / "dim_company" / f"dim_company_{ts}.parquet"
+
+            # placeholders for the new FKs – to be populated later
+            subsector_col = pd.Series([None] * len(df_company), dtype="object")
+            industry_id_col = pd.Series([None] * len(df_company), dtype="object")
+            industry_name_col = pd.Series([None] * len(df_company), dtype="object")
+
+            df_company_out = pd.DataFrame(
+                {
+                    "company_id": df_company["company_id"].astype("int64"),
+                    "cik": df_company["cik"].astype("Int64"),
+                    "name": df_company["name"].astype(str),
+                    "ticker": (df_company.get("ticker") or pd.Series([None] * len(df_company))).astype(object),
+                    "sector_id": (df_company.get("sector_id") or pd.Series([None] * len(df_company))).astype("Int64"),
+                    "subsector_id": subsector_col.astype("Int64"),
+                    "industry_id": industry_id_col.astype("Int64"),
+                    "industry_name": industry_name_col.astype(object),
+                    "sic_code": (df_company.get("sic") or pd.Series([None] * len(df_company))).astype("Int64"),
+                    "fiscal_year_end_month": df_company["fiscal_year_end_month"].astype("Int64"),
+                    "fiscal_year_end_day": df_company["fiscal_year_end_day"].astype("Int64"),
+                }
+            )
+
+            pq.write_table(pa.Table.from_pandas(df_company_out), out, compression="zstd")
+            status(f"  wrote {out.name} ({len(df_company_out):,} rows)")
+
+        # ---------------- dim_listing ----------------
+        with Timer("Build dim_listing (from tickers)"):
+            if not tick.empty:
+                listings: List[Dict[str, Any]] = []
+                for i, r in enumerate(tick.itertuples(index=False), 1):
+                    if pd.isna(r.cik) or pd.isna(r.ticker):
+                        continue
+                    listings.append(
+                        {
+                            "listing_id": listing_id_from_fields(
+                                str(int(r.cik)), str(r.ticker), str(r.exchange or "")
+                            ),
+                            "company_id": company_id_from_cik(str(int(r.cik))),
+                            "ticker": str(r.ticker),
+                            "exchange": (str(r.exchange) if pd.notna(r.exchange) else None),
+                            "start_date": None,
+                            "end_date": None,
+                            "is_primary": True,
+                        }
+                    )
+                    if i % 5000 == 0:
+                        status(f"  … listings progress: {i:,}")
+
+                if listings:
+                    outp = STAR / "dim_listing" / f"dim_listing_{ts}.parquet"
+                    pq.write_table(
+                        pa.Table.from_pandas(pd.DataFrame(listings)), outp, compression="zstd"
+                    )
+                    status(f"  wrote {outp.name} ({len(listings):,} rows)")
+            else:
+                status("  no tickers — skipped")
+
+        # ---------------- dim_security ----------------
+        with Timer("Build dim_security (from tickers)"):
+            if not tick.empty:
+                secs: List[Dict[str, Any]] = []
+                for i, r in enumerate(tick.itertuples(index=False), 1):
+                    if pd.isna(r.cik) or pd.isna(r.ticker):
+                        continue
+                    secs.append(
+                        {
+                            "security_id": security_id_from_fields(
+                                str(int(r.cik)), str(r.ticker), str(r.exchange or ""), ""
+                            ),
+                            "company_id": company_id_from_cik(str(int(r.cik))),
+                            "ticker": str(r.ticker),
+                            "cusip": None,
+                            "isin": None,
+                            "exchange": (str(r.exchange) if pd.notna(r.exchange) else None),
+                            "share_class": None,
+                            "currency": "USD",
+                            "status": "ACTIVE",
+                            "listing_date": None,
+                            "delisting_date": None,
+                        }
+                    )
+                    if i % 5000 == 0:
+                        status(f"  … securities progress: {i:,}")
+
+                if secs:
+                    outp = STAR / "dim_security" / f"dim_security_{ts}.parquet"
+                    pq.write_table(
+                        pa.Table.from_pandas(pd.DataFrame(secs).drop_duplicates("security_id")),
+                        outp,
+                        compression="zstd",
+                    )
+                    status(f"  wrote {outp.name} ({len(secs):,} rows)")
+            else:
+                status("  no tickers — skipped")
+
+        # ---------------- dim_metric ----------------
+        with Timer("Build dim_metric"):
+            con.execute("CREATE OR REPLACE VIEW metric_src AS SELECT DISTINCT tag AS xbrl_tag FROM best;")
+            tags = [r[0] for r in con.execute("SELECT xbrl_tag FROM metric_src").fetchall()]
+            status(f"  unique tags: {len(tags):,}")
+
+            if tags:
+                dfm = pd.DataFrame(
+                    [
+                        {
+                            "metric_id": metric_id_from_tag(t),
+                            "metric_name": t,
+                            "xbrl_tag": t,
+                            "normal_balance": None,
+                        }
+                        for t in tags
+                    ]
+                ).drop_duplicates("metric_id")
+
+                outp = STAR / "dim_metric" / f"dim_metric_{ts}.parquet"
+                pq.write_table(pa.Table.from_pandas(dfm), outp, compression="zstd")
+                status(f"  wrote {outp.name} ({len(dfm):,} rows)")
+
+        # ---------------- dim_unit ------------------
+        with Timer("Build dim_unit"):
+            con.execute(
+                "CREATE OR REPLACE VIEW unit_src AS SELECT DISTINCT unit AS unit_code FROM best WHERE unit IS NOT NULL;"
+            )
+            units = [r[0] for r in con.execute("SELECT unit_code FROM unit_src").fetchall()]
+            status(f"  unique units: {len(units):,}")
+
+            if units:
+                dfe = pd.DataFrame(
+                    [
+                        {
+                            "unit_id": unit_id_from_code(u),
+                            "unit_code": u,
+                            "category": "currency",
+                            "iso_currency": "USD",
+                            "decimals_hint": 2,
+                            "description": "Reported unit (scaled USD variant retained)",
+                        }
+                        for u in units
+                    ]
+                ).drop_duplicates("unit_id")
+
+                outp = STAR / "dim_unit" / f"dim_unit_{ts}.parquet"
+                pq.write_table(pa.Table.from_pandas(dfe), outp, compression="zstd")
+                status(f"  wrote {outp.name} ({len(dfe):,} rows)")
+
+        # ---------------- dim_calendar --------------
+        with Timer("Build dim_calendar"):
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW cal_src AS
+                SELECT DISTINCT TRY_CAST("end" AS DATE) dt
+                FROM best
+                WHERE "end" IS NOT NULL
+            """
+            )
+            out_cal = STAR / "dim_calendar" / f"dim_calendar_{ts}.parquet"
+
+            con.execute(
+                f"""
+                COPY (
+                  SELECT
+                    CAST(strftime('%Y%m%d', dt) AS INTEGER) AS calendar_id,
+                    dt AS date,
+                    NULL::INTEGER AS fiscal_year,
+                    NULL::VARCHAR AS fiscal_quarter,
+                    NULL::INTEGER AS fiscal_month,
+                    'calendar'::VARCHAR AS period_type
+                  FROM cal_src
+                  WHERE dt IS NOT NULL
+                ) TO {sql_path(out_cal)} (FORMAT PARQUET);
+            """
+            )
+            cnt = con.execute(
+                f"SELECT COUNT(*) FROM read_parquet({sql_path(out_cal)})"
+            ).fetchone()[0]
+            status(f"  wrote {out_cal.name} ({cnt:,} rows)")
+
+        status("Dimensions built/updated.")
+
+        # ---------------- fact_financials ------------
+        with Timer("Build/append fact_financials"):
+            con.execute(
+                f"CREATE OR REPLACE VIEW dim_filing_all AS SELECT * FROM read_parquet('{(STAR / 'dim_filing')}/*.parquet');"
+            )
+            con.execute(
+                f"CREATE OR REPLACE VIEW dim_metric_all AS SELECT * FROM read_parquet('{(STAR / 'dim_metric')}/*.parquet');"
+            )
+            con.execute(
+                f"CREATE OR REPLACE VIEW dim_unit_all   AS SELECT * FROM read_parquet('{(STAR / 'dim_unit')}/*.parquet');"
+            )
+
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW stage_fact AS
+                SELECT
+                  CAST(b.cik AS BIGINT) AS company_id,
+                  b.tag AS xbrl_tag,
+                  b.unit AS unit_code,
+                  CAST(strftime('%Y%m%d', TRY_CAST(b."end" AS DATE)) AS INTEGER) AS calendar_id,
+                  TRY_CAST(b."end" AS DATE) AS period_end_date,
+                  TRY_CAST(b.filed AS DATE) AS filing_date,
+                  b.form AS form_type,
+                  CAST(b.value AS DOUBLE) AS value,
+                  b.period_type
+                FROM best b
+                WHERE b.value IS NOT NULL AND b."end" IS NOT NULL
+            """
+            )
+
+            con.execute("CREATE OR REPLACE VIEW metric_map AS SELECT xbrl_tag, metric_id FROM dim_metric_all;")
+            con.execute("CREATE OR REPLACE VIEW unit_map   AS SELECT unit_code, unit_id FROM dim_unit_all;")
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW filing_lu AS
+                SELECT
+                  form_type,
+                  TRY_CAST(filing_date AS DATE)      AS filing_date,
+                  TRY_CAST(period_end_date AS DATE)  AS period_end_date,
+                  filing_id
+                FROM dim_filing_all
+            """
+            )
+
+            con.execute(
+                """
+                CREATE OR REPLACE TABLE fact_rows AS
+                SELECT
+                  s.company_id,
+                  m.metric_id,
+                  s.calendar_id,
+                  u.unit_id,
+                  s.value,
+                  f.filing_id,
+                  NULL::VARCHAR AS consolidated_flag
+                FROM stage_fact s
+                LEFT JOIN metric_map m ON s.xbrl_tag = m.xbrl_tag
+                LEFT JOIN unit_map   u ON s.unit_code = u.unit_code
+                LEFT JOIN filing_lu  f
+                  ON s.form_type = f.form_type
+                 AND s.filing_date IS NOT DISTINCT FROM f.filing_date
+                 AND s.period_end_date IS NOT DISTINCT FROM f.period_end_date
+                WHERE m.metric_id IS NOT NULL AND u.unit_id IS NOT NULL
+            """
+            )
+
+            total_rows = con.execute("SELECT COUNT(*) FROM fact_rows").fetchone()[0]
+            status(f"  staged fact rows = {total_rows:,}")
+
+            if parquet_exists(STAR / "fact_financials"):
+                con.execute(
+                    f"""
+                    CREATE OR REPLACE VIEW fact_existing AS
+                    SELECT
+                      company_id,
+                      metric_id,
+                      calendar_id,
+                      unit_id
+                    FROM read_parquet('{(STAR / 'fact_financials')}/*.parquet')
+                """
+                )
+            else:
+                con.execute(
+                    """
+                    CREATE OR REPLACE VIEW fact_existing AS
+                    SELECT
+                      CAST(NULL AS BIGINT)   AS company_id,
+                      CAST(NULL AS BIGINT)   AS metric_id,
+                      CAST(NULL AS INTEGER)  AS calendar_id,
+                      CAST(NULL AS BIGINT)   AS unit_id
+                    WHERE FALSE;
+                """
+                )
+
+            con.execute(
+                """
+                CREATE OR REPLACE TABLE fact_new AS
+                SELECT
+                  f.*
+                FROM fact_rows f
+                LEFT JOIN fact_existing e
+                  ON f.company_id  = e.company_id
+                 AND f.metric_id   = e.metric_id
+                 AND f.calendar_id = e.calendar_id
+                 AND f.unit_id     = e.unit_id
+                WHERE e.company_id IS NULL
+            """
+            )
+
+            new_count = con.execute("SELECT COUNT(*) FROM fact_new").fetchone()[0]
+            status(f"  new fact rows to append = {new_count:,}")
+
+            if new_count:
+                out_fact = STAR / "fact_financials" / f"fact_financials_{ts}.parquet"
+                con.execute(
+                    f"""
+                    COPY (
+                      SELECT
+                        company_id,
+                        metric_id,
+                        calendar_id,
+                        CAST(value AS DOUBLE) AS value,
+                        unit_id,
+                        filing_id,
+                        consolidated_flag
+                      FROM fact_new
+                      ORDER BY company_id, metric_id, calendar_id, unit_id
+                    ) TO {sql_path(out_fact)} (FORMAT PARQUET);
+                """
+                )
+                status(f"  wrote {out_fact.name}")
+
+    status("append_star: complete")
+
+
+# ------------------------------- MAIN -----------------------------------
+
+def main():
+    status("Star v3 build: start")
+    best = WARE / "_best_local.parquet"
+    fye = WARE / "dim_fiscal_year_end.parquet"
+    quarters = WARE / "fact_quarters_true.parquet"
+
+    with Timer("Phase 1 — Build BEST"):
+        build_best_parquet(best)
+
+    with Timer("Phase 2 — Compute FYE & quarters"):
+        compute_fye_and_quarters(best, fye, quarters)
+
+    with Timer("Phase 3 — Seed reference dims"):
+        seed_reference_dims()
+
+    with Timer("Phase 4 — Build dim_filing (local submissions)"):
+        path_filing = build_dim_filing_from_local(STAR / "dim_filing")
+        status(f"dim_filing update: {path_filing.name if path_filing else 'no rows'}")
+
+    with Timer("Phase 5 — Build dims + facts"):
+        append_star(best, fye)
+
+    status("Star v3 build: DONE ✅")
+
+
+if __name__ == "__main__":
+    main()
