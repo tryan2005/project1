@@ -45,9 +45,9 @@ This is **not** an API project: it runs entirely on pre-downloaded SEC files sto
 ## Data Sources
 
 All SEC data is stored under:
-
+'''
 C:\smilefund_project\data\sec\
-
+'''
 ## Folder Structure
 
 ## Technololgy Stack
