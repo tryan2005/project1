@@ -55,6 +55,197 @@ C:\smilefund_project\data\sec\
 
 ## Star Schema
 
+```
+CREATE TABLE `dim_calendar` (
+  `calendar_id` INT,
+  `date` DATE,
+  `fiscal_year` INT,
+  `fiscal_quarter` VARCHAR(2),
+  `fiscal_month` INT,
+  `period_type` VARCHAR(10),
+  PRIMARY KEY (`calendar_id`)
+);
+
+CREATE TABLE `dim_sector` (
+  `sector_id` INT,
+  `sector_name` VARCHAR(50),
+  PRIMARY KEY (`sector_id`)
+);
+
+CREATE TABLE `dim_subsector` (
+  `subsector_id` INT,
+  `subsector_name` VARCHAR(255),
+  `subsector_code`  VARCHAR(32),
+  `sector_id` INT,
+  `description` VARCHAR(255),
+  `is_active` BOOLEAN,
+  PRIMARY KEY (`subsector_id`),
+  FOREIGN KEY (`sector_id`)
+      REFERENCES `dim_sector`(`sector_id`)
+);
+
+CREATE TABLE `dim_industry` (
+  `industry_id` INT,
+  `sic_code` INT,
+  `industry_title` VARCHAR(225),
+  `subsector_id` INT,
+  `sector_id` INT,
+  `notes` VARCHAR(255),
+  `is_active` BOOLEAN,
+  PRIMARY KEY (`industry_id`),
+  FOREIGN KEY (`subsector_id`)
+      REFERENCES `dim_subsector`(`subsector_id`),
+  FOREIGN KEY (`sector_id`)
+      REFERENCES `dim_sector`(`sector_id`)
+);
+
+CREATE TABLE `dim_company` (
+  `company_id` INT,
+  `cik` BIGINT,
+  `name` VARCHAR(100),
+  `ticker` VARCHAR(10),
+  `sector_id` INT,
+  `subsector_id` INT,
+  `industry_id` INT,
+  `industry_name` VARCHAR(100),
+  `sic_code` INT,
+  `fiscal_year_end_month` INT,
+  `fiscal_year_end_day` INT,
+  PRIMARY KEY (`company_id`),
+  FOREIGN KEY (`sector_id`)
+      REFERENCES `dim_sector`(`sector_id`),
+  FOREIGN KEY (`subsector_id`)
+      REFERENCES `dim_subsector`(`subsector_id`),
+  FOREIGN KEY (`industry_id`)
+      REFERENCES `dim_industry`(`industry_id`),
+  KEY `UK` (`cik`)
+);
+
+CREATE TABLE `dim_listing` (
+  `listing_id` INT,
+  `company_id` INT,
+  `ticker` VARCHAR(10),
+  `exchange` VARCHAR(10),
+  `start_date` DATE,
+  `end_date` DATE,
+  `is_primary` BOOLEAN,
+  PRIMARY KEY (`listing_id`),
+  FOREIGN KEY (`company_id`)
+      REFERENCES `dim_company`(`company_id`)
+);
+
+CREATE TABLE `dim_security` (
+  `security_id` SERIAL,
+  `company_id` INT,
+  `ticker` VARCHAR(10),
+  `cusip` VARCHAR(12),
+  `isin` VARCHAR(12),
+  `exchange` VARCHAR(20),
+  `share_class` VARCHAR(20),
+  `currency` VARCHAR(3),
+  `status` VARCHAR(20),
+  `listing_date` DATE,
+  `delisting_date` DATE,
+  PRIMARY KEY (`security_id`)
+);
+
+CREATE TABLE `dim_metric` (
+  `metric_id` INT,
+  `metric_name` VARCHAR(100),
+  `xrbl_tag` VARCHAR(100),
+  `normal_balance` VARCHAR(10),
+  PRIMARY KEY (`metric_id`)
+);
+
+CREATE TABLE `dim_filing` (
+  `filing_id` SERIAL,
+  `form_type` VARCHAR(10),
+  `filing_date` DATE,
+  `accepted_date` DATE,
+  `period_end_date` DATE,
+  `accession_number` VARCHAR(30),
+  `filing_url` VARCHAR(255),
+  PRIMARY KEY (`filing_id`)
+);
+
+CREATE TABLE `dim_unit` (
+  `unit_id` SERIAL,
+  `unit_code` VARCHAR(20),
+  `category` VARCHAR(20),
+  `iso_currency` VARCHAR(3),
+  `decimals_hint` INT,
+  `description` VARCHAR(100),
+  PRIMARY KEY (`unit_id`)
+);
+
+CREATE TABLE `fact_financials` (
+  `financial_id` SERIAL,
+  `company_id` INT,
+  `metric_id` INT,
+  `calendar_id` INT,
+  `value` NUMERIC(18,2),
+  `unit_id` INT,
+  `filing_id` INT,
+  `consolidated_flag` VARCHAR(20),
+  PRIMARY KEY (`financial_id`),
+  FOREIGN KEY (`filing_id`)
+      REFERENCES `dim_filing`(`filing_id`),
+  FOREIGN KEY (`calendar_id`)
+      REFERENCES `dim_calendar`(`calendar_id`),
+  FOREIGN KEY (`metric_id`)
+      REFERENCES `dim_metric`(`metric_id`),
+  FOREIGN KEY (`company_id`)
+      REFERENCES `dim_company`(`company_id`),
+  FOREIGN KEY (`unit_id`)
+      REFERENCES `dim_unit`(`unit_id`)
+);
+
+CREATE TABLE `dim_company_profile` (
+  `company_id` INT,
+  `country` VARCHAR(50),
+  `state_incorporation` VARCHAR(50),
+  `hq_city` VARCHAR(100),
+  `hq_state` VARCHAR(100),
+  `website` VARCHAR(225),
+  FOREIGN KEY (`company_id`)
+      REFERENCES `dim_company`(`company_id`)
+);
+
+CREATE TABLE `sic_sector_ranges` (
+  `range_id` INT,
+  `sic_min` INT,
+  `sic_max` INT,
+  `sector_id` INT,
+  `notes` TEXT,
+  PRIMARY KEY (`range_id`),
+  FOREIGN KEY (`sector_id`)
+      REFERENCES `dim_sector`(`sector_id`)
+);
+
+CREATE TABLE `dim_company_ids` (
+  `ids_id` INT,
+  `company_id` INT,
+  `legal_name` VARCHAR(225),
+  `lei` VARCHAR(20),
+  PRIMARY KEY (`ids_id`),
+  FOREIGN KEY (`company_id`)
+      REFERENCES `dim_company`(`company_id`)
+);
+
+CREATE TABLE `fact_holdings` (
+  `holding_id` SERIAL,
+  `company_id` INT,
+  `asof_date` DATE,
+  `weight` NUMERIC(8,5),
+  `shares` NUMERIC(18,2),
+  `market_value` NUMERIC(18,2),
+  `source` VARCHAR(50),
+  PRIMARY KEY (`holding_id`),
+  FOREIGN KEY (`company_id`)
+      REFERENCES `dim_company`(`company_id`)
+);
+```
+
 ## Installation & Setup
 
 ## Configuration
