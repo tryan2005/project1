@@ -290,6 +290,12 @@ DUCKDB_PATH = warehouse\sec_warehouse.duckdb
 
 ## How to Run 
 
+```
+.venv\Scripts\activate
+py src\sec_warehouse_star.py
+```
+*Script will:*
+
 ## Example Queries
 
 **Latest Revenue for AAPL**
