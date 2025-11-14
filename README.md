@@ -292,6 +292,26 @@ DUCKDB_PATH = warehouse\sec_warehouse.duckdb
 
 ## Example Queries
 
+Latest Revenue for **AAPL**
+
+```
+SELECT
+    c.legal_name,
+    ids.id_value AS ticker,
+    cal.year,
+    f.value AS revenue
+FROM fact_financials f
+JOIN dim_metric m ON f.metric_id = m.metric_id
+JOIN dim_company c ON f.company_id = c.company_id
+JOIN dim_company_ids ids ON f.company_id = ids.company_id
+JOIN dim_calendar cal ON f.calendar_id = cal.calendar_id
+WHERE m.normalized_name = 'Revenue'
+  AND ids.id_type = 'ticker'
+  AND ids.id_value = 'AAPL'
+ORDER BY cal.year DESC
+LIMIT 5;
+```
+
 ## Data Quality & Normalization
 
 ## Planned Extensions
