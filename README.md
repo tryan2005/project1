@@ -71,7 +71,6 @@ smilefund_project/
 
 ## Technololgy Stack
 
-```
 'Python 3.x'
 'DuckDB'
 'Parquet (PyArrow)'
