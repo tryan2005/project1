@@ -48,3 +48,7 @@ All SEC data is stored under:
 
 ```text
 C:\smilefund_project\data\sec\
+
+## Folder-Structure
+
+## Technology-Stack
