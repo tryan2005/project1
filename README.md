@@ -46,6 +46,25 @@ This is **not** an API project: it runs entirely on pre-downloaded SEC files sto
 
 All SEC data is stored under:
 
-```text
 C:\smilefund_project\data\sec\
+
+## Folder Structure
+
+## Technololgy Stack
+
+## Star Schema
+
+## Installation & Setup
+
+## Configuration
+
+## How to Run 
+
+## Example Queries
+
+## Data Quality & Normalization
+
+## Planned Extensions
+
+## Conventions
 
