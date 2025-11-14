@@ -581,7 +581,7 @@ def seed_reference_dims():
         status(" dim_industry present — skipping")
 
 
-# -------------------------- DIM BUILDERS --------------------------------
+# -------------------------- DIM BUILDERS (SUBMISSIONS) ------------------
 
 def build_dim_filing_from_local(out_dir: Path) -> Optional[Path]:
     status("build dim_filing: start")
@@ -651,7 +651,65 @@ def build_dim_filing_from_local(out_dir: Path) -> Optional[Path]:
     return out_path
 
 
-def append_star(best_parquet: Path, fye_parquet: Path):
+def build_company_meta_from_submissions(out_dir: Path) -> Optional[Path]:
+    """
+    Build per-CIK company metadata (SIC, state/country of incorporation)
+    from submissions, restricted to CIKs that appear in company_facts.
+    """
+    status("build company_meta_from_submissions: start")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows: List[Dict[str, Any]] = []
+
+    ciks = set()
+    for f in iter_companyfacts_files():
+        try:
+            d = read_json_local(f)
+            ciks.add(int(d.get("cik", 0)))
+        except:
+            pass
+
+    status(f" company_meta: CIK universe size = {len(ciks):,}")
+
+    with Timer("Extract submissions → company_meta rows"):
+        for idx, cik in enumerate(sorted(ciks), 1):
+            s = load_submissions_local(cik)
+            if not s:
+                continue
+
+            sic_raw = s.get("sic")
+            try:
+                sic = int(sic_raw) if sic_raw is not None else None
+            except Exception:
+                sic = None
+
+            rows.append(
+                {
+                    "cik": int(cik),
+                    "sic_sub": sic,
+                    "state_inc": s.get("stateOfIncorporation"),
+                    "country_inc": s.get("countryOfIncorporation"),
+                    "entity_type": s.get("entityType"),
+                }
+            )
+
+            if idx % 250 == 0:
+                status(f" … company_meta progress: {idx:,}/{len(ciks):,} CIKs, rows={len(rows):,}")
+
+    if not rows:
+        status(" company_meta_from_submissions: no rows produced")
+        return None
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = out_dir / f"company_meta_from_submissions_{ts}.parquet"
+    df = pd.DataFrame(rows).drop_duplicates("cik")
+    pq.write_table(pa.Table.from_pandas(df), out_path, compression="zstd")
+    status(f" company_meta write: {out_path.name} ({len(df):,} rows)")
+    return out_path
+
+
+# -------------------------- DIM BUILDERS (STAR) -------------------------
+
+def append_star(best_parquet: Path, fye_parquet: Path, company_meta_parquet: Optional[Path] = None):
     status("append_star: begin building dimensions + facts")
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -674,6 +732,20 @@ def append_star(best_parquet: Path, fye_parquet: Path):
         (STAR / sub).mkdir(parents=True, exist_ok=True)
 
     tick = load_company_tickers()
+
+    # Load company_meta from submissions if available
+    company_meta_df: Optional[pd.DataFrame] = None
+    if company_meta_parquet is not None and company_meta_parquet.exists():
+        try:
+            company_meta_df = pd.read_parquet(company_meta_parquet)
+            if not company_meta_df.empty:
+                company_meta_df["cik"] = pd.to_numeric(company_meta_df["cik"], errors="coerce").astype("Int64")
+                status(f" company_meta_from_submissions loaded: {len(company_meta_df):,} rows")
+            else:
+                company_meta_df = None
+        except Exception as e:
+            status(f" warn: could not read company_meta_from_submissions: {e}")
+            company_meta_df = None
 
     with duckdb.connect() as con:
         set_duckdb(con)
@@ -707,6 +779,7 @@ def append_star(best_parquet: Path, fye_parquet: Path):
             df_company = pd.DataFrame(rows).drop_duplicates("company_id")
             status(f"  dim_company seeds from facts: {len(df_company):,} companies")
 
+            # Merge tickers (adds ticker, exchange, sic from company_tickers.json)
             if not tick.empty:
                 df_company = df_company.merge(
                     tick.rename(columns={"title": "title_from_tickers"})[["cik", "ticker", "exchange", "sic"]],
@@ -714,6 +787,20 @@ def append_star(best_parquet: Path, fye_parquet: Path):
                     how="left",
                 )
                 status("  merged tickers onto companies")
+
+            # Merge submissions-based company_meta (sic_sub, state_inc, country_inc)
+            if company_meta_df is not None:
+                df_company = df_company.merge(
+                    company_meta_df[["cik", "sic_sub", "state_inc", "country_inc"]],
+                    on="cik",
+                    how="left",
+                )
+                # coalesce SIC: prefer ticker.sic, then submissions.sic_sub
+                if "sic" not in df_company.columns:
+                    df_company["sic"] = df_company["sic_sub"]
+                else:
+                    df_company["sic"] = df_company["sic"].fillna(df_company["sic_sub"])
+                status("  merged submissions metadata (sic_sub/state_inc/country_inc)")
 
             # fiscal year-end month
             with duckdb.connect() as c2:
@@ -1105,8 +1192,12 @@ def main():
         path_filing = build_dim_filing_from_local(STAR / "dim_filing")
         status(f"dim_filing update: {path_filing.name if path_filing else 'no rows'}")
 
+    with Timer("Phase 4b — Build company_meta from submissions"):
+        path_company_meta = build_company_meta_from_submissions(STAR / "dim_company_meta")
+        status(f"company_meta update: {path_company_meta.name if path_company_meta else 'no rows'}")
+
     with Timer("Phase 5 — Build dims + facts"):
-        append_star(best, fye)
+        append_star(best, fye, path_company_meta)
 
     status("Star v3 build: DONE ✅")
 
