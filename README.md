@@ -47,6 +47,7 @@ This is **not** an API project: it runs entirely on pre-downloaded SEC files sto
 ```
 (https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip)
 (http://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip)
+(https://www.sec.gov/files/company_tickers.json)
 ```
 
 ## Folder Structure
