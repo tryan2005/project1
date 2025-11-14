@@ -348,3 +348,7 @@ LIMIT 5;
 
 ## Conventions
 
+- Dim_* = dimension tables
+- fact_* = fact tables
+- *_id = primary keys
+- snake_case for python
