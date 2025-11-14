@@ -44,9 +44,9 @@ This is **not** an API project: it runs entirely on pre-downloaded SEC files sto
 
 ## Data Sources
 
-All SEC data is stored under:
 ```
-C:\smilefund_project\data\sec\
+(https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip)
+(http://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip)
 ```
 
 ## Folder Structure
