@@ -80,7 +80,6 @@ smilefund_project/
 
 ## Star Schema
 
-```
 CREATE TABLE `dim_calendar` (
   `calendar_id` INT,
   `date` DATE,
@@ -118,10 +117,10 @@ CREATE TABLE `dim_industry` (
   `notes` VARCHAR(255),
   `is_active` BOOLEAN,
   PRIMARY KEY (`industry_id`),
-  FOREIGN KEY (`subsector_id`)
-      REFERENCES `dim_subsector`(`subsector_id`),
   FOREIGN KEY (`sector_id`)
-      REFERENCES `dim_sector`(`sector_id`)
+      REFERENCES `dim_sector`(`sector_id`),
+  FOREIGN KEY (`subsector_id`)
+      REFERENCES `dim_subsector`(`subsector_id`)
 );
 
 CREATE TABLE `dim_company` (
@@ -137,12 +136,12 @@ CREATE TABLE `dim_company` (
   `fiscal_year_end_month` INT,
   `fiscal_year_end_day` INT,
   PRIMARY KEY (`company_id`),
-  FOREIGN KEY (`sector_id`)
-      REFERENCES `dim_sector`(`sector_id`),
   FOREIGN KEY (`subsector_id`)
       REFERENCES `dim_subsector`(`subsector_id`),
   FOREIGN KEY (`industry_id`)
       REFERENCES `dim_industry`(`industry_id`),
+  FOREIGN KEY (`sector_id`)
+      REFERENCES `dim_sector`(`sector_id`),
   KEY `UK` (`cik`)
 );
 
@@ -269,7 +268,6 @@ CREATE TABLE `fact_holdings` (
   FOREIGN KEY (`company_id`)
       REFERENCES `dim_company`(`company_id`)
 );
-```
 
 ## Installation & Setup
 
