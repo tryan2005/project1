@@ -79,7 +79,7 @@ smilefund_project/
 - Standard Library: `json`, `zipfile`, `pathlib`, `datetime`, `hashlib`
 
 ## Star Schema
-
+```
 CREATE TABLE `dim_calendar` (
   `calendar_id` INT,
   `date` DATE,
@@ -268,6 +268,7 @@ CREATE TABLE `fact_holdings` (
   FOREIGN KEY (`company_id`)
       REFERENCES `dim_company`(`company_id`)
 );
+```
 
 ## Installation & Setup
 
