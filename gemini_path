@@ -6,7 +6,7 @@ A monolithic ETL script to ingest, normalize, and model SEC EDGAR data for Power
 Core Capabilities:
 - Hybrid Sync: Combines historical archives with incremental API updates.
 - Star Schema: Produces DIM/FACT tables in Parquet format.
-- Financial Logic: Handles TTM, Unit Scaling, Fiscal Alignments, and Sign Normalization.
+- Financial Logic: Handles TTM, Unit Scaling (Billions/Millions), Fiscal Alignments, and Weights.
 - Discovery: Logs unknown XBRL tags for student review.
 
 Author: University of Tennessee at Chattanooga - SMILE Fund
@@ -51,7 +51,7 @@ CONFIG = {
     'flush_buffer_size': 100_000,
 }
 
-# Directory Structure (The "Truth")
+# Directory Structure
 DIRS = {
     'config': CONFIG['base_dir'] / "config",
     'raw_facts': CONFIG['base_dir'] / "data" / "sec" / "raw" / "company_facts",
@@ -69,11 +69,22 @@ FILES = {
     'error_log': DIRS['logs'] / "etl_errors.log",
 }
 
-# Unit Normalization Logic
+# Unit Normalization Logic (Base 1)
 UNIT_SCALERS = {
+    # Currency
     'USD': 1.0, 'usd': 1.0, 'iso4217:USD': 1.0,
-    'USDThousands': 1000.0, 'USDMillions': 1000000.0,
-    'shares': 1.0, 'pure': 1.0
+    'USDThousands': 1000.0, 'usdthousands': 1000.0,
+    'USDMillions': 1000000.0, 'usdmillions': 1000000.0,
+    'USDBillions': 1000000000.0, 'usdbillions': 1000000000.0,
+
+    # Shares
+    'shares': 1.0,
+    'sharesThousands': 1000.0, 'sharesthousands': 1000.0,
+    'sharesMillions': 1000000.0, 'sharesmillions': 1000000.0,
+    'sharesBillions': 1000000000.0, 'sharesbillions': 1000000000.0,
+
+    # Ratios
+    'pure': 1.0
 }
 
 # ==============================================================================
@@ -314,7 +325,7 @@ def build_staging():
                 mid = tag_to_id.get(tag)
 
                 for unit_name, records in content.get('units', {}).items():
-                    # Unit Scaling
+                    # Unit Scaling (Billions/Millions/Thousands)
                     scale_factor = 1.0
                     for k, v in UNIT_SCALERS.items():
                         if k in unit_name:
@@ -569,7 +580,6 @@ def build_marts():
     atomic_write_parquet(con, "base_financials", DIRS['marts'] / "mart_quarterly.parquet")
 
     # --- MART 2: TTM ---
-    # Sums last 4 periods for Income Statement; Takes latest value for Balance Sheet
     con.execute("""
         WITH windowed AS (
             SELECT 
