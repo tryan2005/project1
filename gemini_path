@@ -1,0 +1,580 @@
+import os
+import re
+import gc
+import json
+import time
+import shutil
+import datetime
+import hashlib
+import requests
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Iterable, Optional
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import duckdb
+
+# ==============================================================================
+# CONFIGURATION & CONSTANTS
+# ==============================================================================
+
+BASE = Path(r"C:\smilefund_project")
+CONFIG_DIR = BASE / "config"
+DATA_DIR = BASE / "data" / "sec"
+RAW_FACTS_DIR = DATA_DIR / "raw" / "company_facts"
+RAW_SUBM_DIR = DATA_DIR / "raw" / "submissions"
+WAREHOUSE = BASE / "warehouse"
+
+# Warehouse Layers
+STAGING = WAREHOUSE / "staging"
+STAR = WAREHOUSE / "star"
+MARTS = WAREHOUSE / "marts"
+LOGS = WAREHOUSE / "logs"
+
+# Files
+TAG_MAP_FILE = CONFIG_DIR / "xbrl_tag_map.csv"
+TICKERS_JSON = DATA_DIR / "raw" / "meta" / "company_tickers.json"
+ERROR_LOG_FILE = LOGS / "etl_errors.log"
+
+# Settings
+START_DATE = "2015-01-01"
+DUCK_MEM = "24GB"  # 32GB RAM Optimization
+
+# SEC API SETTINGS
+SEC_USER_AGENT = "UTC SMILE Fund (vtn183@mocs.utc.edu)"
+API_RATE_LIMIT_SLEEP = 0.15 
+MAX_RETRIES = 3
+
+# Unit Scaling Map (Normalize everything to base 1)
+UNIT_SCALERS = {
+    'USD': 1.0,
+    'usd': 1.0,
+    'iso4217:USD': 1.0,
+    'USDThousands': 1000.0,
+    'USDMillions': 1000000.0,
+    'shares': 1.0,
+    'pure': 1.0
+}
+
+# ==============================================================================
+# UTILITIES & LOGGING
+# ==============================================================================
+
+# Setup Logging
+logging.basicConfig(
+    filename=ERROR_LOG_FILE,
+    level=logging.ERROR,
+    format='%(asctime)s:%(levelname)s:%(message)s'
+)
+
+def status(msg: str):
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+class Timer:
+    def __init__(self, label: str):
+        self.label = label
+        self.t0 = None
+    def __enter__(self):
+        self.t0 = time.time()
+        status(f"▶ {self.label} — start")
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        dt = time.time() - self.t0
+        if exc:
+            status(f"✖ {self.label} — ERROR after {dt:,.1f}s: {exc}")
+            logging.error(f"Timer context failed: {exc}")
+        else:
+            status(f"✔ {self.label} — done in {dt:,.1f}s")
+
+def get_duckdb():
+    con = duckdb.connect()
+    con.execute("PRAGMA threads=8;") 
+    con.execute(f"PRAGMA memory_limit='{DUCK_MEM}';")
+    return con
+
+def atomic_write_parquet(con, table_name_or_query, out_path: Path):
+    """
+    Writes to a temp file first, then renames to avoid locking issues with Power BI.
+    Ensures parent directory exists.
+    """
+    if not out_path.parent.exists():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    temp_path = out_path.with_name(f"{out_path.stem}_temp{out_path.suffix}")
+    try:
+        if "SELECT" in table_name_or_query.upper():
+            query = f"COPY ({table_name_or_query}) TO '{temp_path}' (FORMAT PARQUET, COMPRESSION 'ZSTD')"
+        else:
+            query = f"COPY {table_name_or_query} TO '{temp_path}' (FORMAT PARQUET, COMPRESSION 'ZSTD')"
+        
+        con.execute(query)
+        
+        if out_path.exists():
+            try:
+                out_path.unlink()
+            except PermissionError:
+                status(f"⚠️ Locked: Could not swap {out_path.name}. Saved to {temp_path.name}")
+                return
+
+        temp_path.rename(out_path)
+        status(f"✔ Wrote {out_path.name}")
+    except Exception as e:
+        status(f"❌ Write Failed: {e}")
+        logging.error(f"Write failed for {out_path}: {e}")
+        if temp_path.exists(): temp_path.unlink()
+
+def ensure_folders():
+    for d in [CONFIG_DIR, RAW_FACTS_DIR, RAW_SUBM_DIR, STAGING, STAR, MARTS, LOGS, DATA_DIR / "raw" / "meta"]:
+        d.mkdir(parents=True, exist_ok=True)
+    
+    # Ensure Star Schema Subfolders exist (Table per folder)
+    for sub in ["dim_company", "dim_calendar", "dim_metric", "dim_unit", 
+                "dim_filing", "fact_financials", "dim_sector", "dim_listing", "dim_security", 
+                "dim_subsector", "dim_industry", "sic_sector_ranges", "dim_company_profile", "dim_company_ids"]:
+        (STAR / sub).mkdir(parents=True, exist_ok=True)
+
+# ==============================================================================
+# PHASE 1: API UPDATER
+# ==============================================================================
+
+def fetch_with_retry(url, headers):
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            if r.status_code == 200:
+                return r
+            elif r.status_code == 429:
+                sleep_time = 10 * (attempt + 1)
+                status(f"API 429 Hit. Sleeping {sleep_time}s...")
+                time.sleep(sleep_time)
+            elif r.status_code in [500, 502, 503]:
+                time.sleep(5)
+            else:
+                return r 
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Network error {url}: {e}")
+            time.sleep(5)
+    return None
+
+def update_from_api():
+    status("API Update: Starting Sync...")
+    
+    # Disk Check
+    total, used, free = shutil.disk_usage(BASE)
+    if free // (2**30) < 5:
+        status("❌ CRITICAL: Less than 5GB disk space. Aborting API update.")
+        return
+
+    headers = {
+        "User-Agent": SEC_USER_AGENT,
+        "Accept-Encoding": "gzip, deflate",
+        "Host": "data.sec.gov"
+    }
+
+    # 1. Update Tickers
+    r = fetch_with_retry("https://www.sec.gov/files/company_tickers.json", headers)
+    if r and r.status_code == 200:
+        with open(TICKERS_JSON, "wb") as f: f.write(r.content)
+        status("API: Tickers refreshed.")
+    else:
+        status("API: Failed to refresh tickers.")
+        return
+
+    # 2. Load Target List
+    with open(TICKERS_JSON, "r") as f: raw_tickers = json.load(f)
+    active_ciks = [int(val['cik_str']) for val in raw_tickers.values()]
+    status(f"API: Syncing {len(active_ciks)} active companies.")
+
+    files_updated = 0
+    errors = 0
+
+    for i, cik in enumerate(active_ciks):
+        cik_padded = f"CIK{cik:010d}"
+        
+        # A. FACTS SYNC
+        fact_path = RAW_FACTS_DIR / f"{cik_padded}.json"
+        should_download = True
+        
+        if fact_path.exists():
+            mtime = datetime.datetime.fromtimestamp(fact_path.stat().st_mtime)
+            if datetime.datetime.now() - mtime < datetime.timedelta(hours=24):
+                should_download = False
+        
+        if should_download:
+            r = fetch_with_retry(f"https://data.sec.gov/api/xbrl/companyfacts/{cik_padded}.json", headers)
+            if r and r.status_code == 200:
+                try:
+                    json.loads(r.content) # Validate
+                    with open(fact_path, "wb") as f: f.write(r.content)
+                    files_updated += 1
+                except json.JSONDecodeError:
+                    logging.error(f"Corrupt JSON received for {cik}")
+            elif r and r.status_code != 404:
+                errors += 1
+            time.sleep(API_RATE_LIMIT_SLEEP)
+
+        # B. SUBMISSIONS SYNC
+        subm_path = RAW_SUBM_DIR / f"{cik_padded}.json"
+        if not subm_path.exists() or should_download:
+            r_sub = fetch_with_retry(f"https://data.sec.gov/submissions/{cik_padded}.json", headers)
+            if r_sub and r_sub.status_code == 200:
+                with open(subm_path, "wb") as f: f.write(r_sub.content)
+            time.sleep(API_RATE_LIMIT_SLEEP)
+
+        if i % 100 == 0:
+            status(f"API Progress: {i}/{len(active_ciks)}")
+
+    status(f"API Update Complete. Updated {files_updated} files. Errors logged.")
+
+# ==============================================================================
+# PHASE 2: STAGING (CLEANING & NORMALIZATION)
+# ==============================================================================
+
+def build_staging():
+    if not TAG_MAP_FILE.exists():
+        status("❌ CRITICAL: Config missing.")
+        return
+    
+    tag_df = pd.read_csv(TAG_MAP_FILE)
+    valid_tags = set(tag_df['xbrl_tag'].unique())
+    tag_to_id = dict(zip(tag_df.xbrl_tag, tag_df.metric_id))
+    
+    unknown_tag_counter = {}
+
+    schema = pa.schema([
+        ("cik", pa.int64()), ("tag", pa.string()), ("metric_id", pa.int32()),
+        ("val", pa.float64()), ("unit", pa.string()), 
+        ("fy", pa.int32()), ("fp", pa.string()), ("form", pa.string()), 
+        ("filed", pa.date32()), ("end", pa.date32()), ("frame", pa.string())
+    ])
+
+    out_file = STAGING / "_best_local.parquet"
+    writer = pq.ParquetWriter(out_file, schema, compression="zstd")
+    rows_buffer = []
+    
+    files = list(RAW_FACTS_DIR.glob("*.json"))
+    status(f"Staging: Processing {len(files)} files...")
+
+    for i, fpath in enumerate(files):
+        try:
+            with open(fpath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            cik = int(data.get('cik', 0))
+            facts = data.get('facts', {}).get('us-gaap', {})
+
+            for tag, content in facts.items():
+                
+                # Discovery Mode
+                if tag not in valid_tags:
+                    if 'units' in content:
+                        unknown_tag_counter[tag] = unknown_tag_counter.get(tag, 0) + 1
+                    continue
+
+                mid = tag_to_id.get(tag)
+
+                for unit_name, records in content.get('units', {}).items():
+                    # 1. Scale Detection
+                    scale_factor = 1.0
+                    for k, v in UNIT_SCALERS.items():
+                        if k in unit_name:
+                            scale_factor = v
+                            break
+                    
+                    for r in records:
+                        # 2. Date Parsing
+                        try:
+                            filed_dt = pd.to_datetime(r.get('filed'), errors='coerce')
+                            end_dt = pd.to_datetime(r.get('end'), errors='coerce')
+                            if pd.isna(filed_dt) or pd.isna(end_dt): continue
+                            if end_dt.year < 2015: continue
+                        except:
+                            continue
+                        
+                        # 3. Value Normalization & Outlier Check
+                        try:
+                            raw_val = float(r['val'])
+                            final_val = raw_val * scale_factor
+                            if abs(final_val) > 1e16: 
+                                logging.warning(f"Outlier dropped: CIK {cik} {tag} val {final_val}")
+                                continue
+                        except: continue
+
+                        rows_buffer.append({
+                            'cik': cik, 'tag': tag, 'metric_id': mid,
+                            'val': final_val, 'unit': unit_name,
+                            'fy': r.get('fy', 0), 'fp': r.get('fp', ''),
+                            'form': r.get('form', ''),
+                            'filed': filed_dt.date(),
+                            'end': end_dt.date(),
+                            'frame': r.get('frame', None)
+                        })
+
+        except json.JSONDecodeError:
+            logging.error(f"Corrupt JSON file skipped: {fpath.name}")
+        except Exception as e:
+            logging.error(f"Error processing {fpath.name}: {e}")
+
+        if len(rows_buffer) > 100000:
+            writer.write_table(pa.Table.from_pylist(rows_buffer, schema=schema))
+            rows_buffer = []
+            if i % 500 == 0: status(f"Staging: {i} files...")
+
+    if rows_buffer:
+        writer.write_table(pa.Table.from_pylist(rows_buffer, schema=schema))
+    writer.close()
+
+    if unknown_tag_counter:
+        df_missing = pd.DataFrame(list(unknown_tag_counter.items()), columns=['xbrl_tag', 'frequency'])
+        df_missing.sort_values(by='frequency', ascending=False).to_csv(LOGS / "missing_tags_report.csv", index=False)
+
+    # 4. Dedup Logic
+    con = get_duckdb()
+    con.execute(f"""
+        CREATE TABLE deduped AS 
+        SELECT * EXCLUDE (rn) FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY cik, metric_id, fy, fp, "end" 
+                ORDER BY 
+                    CASE WHEN frame IS NOT NULL THEN 1 ELSE 0 END DESC,
+                    CASE WHEN form LIKE '10-K%%' THEN 1 ELSE 0 END DESC,
+                    filed DESC 
+            ) as rn
+            FROM '{str(out_file)}'
+        ) WHERE rn = 1
+    """)
+    atomic_write_parquet(con, "deduped", out_file)
+    status("Staging: Complete.")
+
+# ==============================================================================
+# PHASE 3: DIMENSION TABLES
+# ==============================================================================
+
+def build_dimensions():
+    con = get_duckdb()
+    ts = datetime.datetime.now().strftime("%Y%m%d")
+
+    # 1. Dim Sector
+    sector_data = [
+        (10, 'Energy'), (15, 'Materials'), (20, 'Industrials'),
+        (25, 'Consumer Discretionary'), (30, 'Consumer Staples'), (35, 'Health Care'),
+        (40, 'Financials'), (45, 'Information Technology'), (50, 'Communication Services'),
+        (55, 'Utilities'), (60, 'Real Estate'), (99, 'Unmapped')
+    ]
+    con.execute("CREATE OR REPLACE TABLE dim_sector (sector_id INT, sector_name VARCHAR)")
+    con.executemany("INSERT INTO dim_sector VALUES (?, ?)", sector_data)
+    atomic_write_parquet(con, "dim_sector", STAR / "dim_sector/dim_sector.parquet")
+
+    # 2. Dim Metric
+    con.execute(f"""
+        CREATE OR REPLACE TABLE dim_metric AS 
+        SELECT DISTINCT metric_id, canonical_metric as metric_name, xbrl_tag, report_section 
+        FROM read_csv_auto('{TAG_MAP_FILE}')
+    """)
+    atomic_write_parquet(con, "dim_metric", STAR / f"dim_metric/dim_metric_{ts}.parquet")
+
+    # 3. Dim Company (Resilient)
+    con.execute("""
+        CREATE TEMP TABLE sic_ranges (sector_id INT, min_sic INT, max_sic INT);
+        INSERT INTO sic_ranges VALUES 
+        (10, 1000, 1499), (10, 2900, 2999), (15, 2000, 2099), (15, 2500, 3999),
+        (20, 1500, 1799), (20, 4000, 4299), (20, 4500, 4799), (20, 5000, 5199),
+        (25, 5600, 5999), (25, 7000, 7999), (30, 5200, 5599), (35, 2830, 2839),
+        (35, 8000, 8099), (40, 6000, 6499), (40, 6700, 6799), (45, 3570, 3679),
+        (45, 7370, 7379), (50, 4800, 4899), (55, 4900, 4999), (60, 6500, 6699);
+    """)
+
+    has_tickers = False
+    if TICKERS_JSON.exists():
+        with open(TICKERS_JSON, 'r') as f:
+            tdata = json.load(f)
+        df_tickers = pd.DataFrame.from_dict(tdata, orient='index')
+        con.register('tickers_raw', df_tickers)
+        has_tickers = True
+
+    query = f"WITH unique_ciks AS (SELECT DISTINCT cik FROM '{STAGING}/_best_local.parquet')"
+    
+    if has_tickers:
+        query += """
+        , base_companies AS (
+            SELECT 
+                u.cik::BIGINT as company_id,
+                u.cik::BIGINT as cik,
+                COALESCE(t.title, 'Delisted/Unknown') as name,
+                t.ticker,
+                t.sic_code::INT as sic_code
+            FROM unique_ciks u
+            LEFT JOIN tickers_raw t ON u.cik = t.cik
+        )
+        """
+    else:
+        query += ", base_companies AS (SELECT u.cik as company_id, u.cik, 'Unknown' as name, NULL as ticker, NULL as sic_code FROM unique_ciks u)"
+
+    query += """
+        SELECT b.*, COALESCE(s.sector_id, 99) as sector_id 
+        FROM base_companies b
+        LEFT JOIN sic_ranges s ON b.sic_code BETWEEN s.min_sic AND s.max_sic
+    """
+    
+    con.execute(f"CREATE OR REPLACE TABLE dim_company AS {query}")
+    atomic_write_parquet(con, "dim_company", STAR / f"dim_company/dim_company_{ts}.parquet")
+
+    # 4. Dim Calendar
+    con.execute(f"""
+        CREATE OR REPLACE TABLE dim_calendar AS
+        WITH dates AS (
+            SELECT DISTINCT "end" as dt FROM '{STAGING}/_best_local.parquet'
+            UNION SELECT DISTINCT filed as dt FROM '{STAGING}/_best_local.parquet'
+        )
+        SELECT 
+            strftime(dt, '%Y%m%d')::INT as calendar_id,
+            dt as date,
+            year(dt) as cal_year,
+            quarter(dt) as cal_quarter,
+            month(dt) as cal_month,
+            'calendar' as period_type
+        FROM dates WHERE dt IS NOT NULL
+    """)
+    atomic_write_parquet(con, "dim_calendar", STAR / f"dim_calendar/dim_calendar_{ts}.parquet")
+
+    # 5. Dim Unit (Derived)
+    con.execute(f"""
+        CREATE OR REPLACE TABLE dim_unit AS
+        SELECT DISTINCT unit as unit_code FROM '{STAGING}/_best_local.parquet'
+    """)
+    atomic_write_parquet(con, "dim_unit", STAR / f"dim_unit/dim_unit_{ts}.parquet")
+
+    # 6. Sic Sector Ranges
+    con.execute("CREATE OR REPLACE TABLE sic_sector_ranges AS SELECT * FROM sic_ranges")
+    atomic_write_parquet(con, "sic_sector_ranges", STAR / f"sic_sector_ranges/sic_sector_ranges_{ts}.parquet")
+
+    status("Dimensions: Built.")
+
+# ==============================================================================
+# PHASE 4: FACT TABLE
+# ==============================================================================
+
+def build_facts():
+    con = get_duckdb()
+    ts = datetime.datetime.now().strftime("%Y%m%d")
+    
+    if not (STAGING / "_best_local.parquet").exists(): return
+
+    tag_df = pd.read_csv(TAG_MAP_FILE)
+    con.register('tag_map', tag_df)
+
+    # Retain Metadata & Apply Weights
+    con.execute(f"""
+        CREATE OR REPLACE TABLE fact_staging AS
+        SELECT 
+            s.cik as company_id,
+            s.metric_id,
+            strftime(s."end", '%Y%m%d')::INT as calendar_id,
+            (s.val * COALESCE(tm.weight, 1)) as value,
+            1 as unit_id,
+            s.fp as fiscal_period, 
+            s.fy as fiscal_year,
+            s.form,
+            'CONSOLIDATED' as consolidated_flag
+        FROM '{STAGING}/_best_local.parquet' s
+        JOIN tag_map tm ON s.metric_id = tm.metric_id
+    """)
+
+    atomic_write_parquet(con, "fact_staging", STAR / "fact_financials" / f"fact_financials_{ts}.parquet")
+    status("Facts: Built.")
+
+# ==============================================================================
+# PHASE 5: MARTS (TTM & QUARTERLY)
+# ==============================================================================
+
+def build_marts():
+    con = get_duckdb()
+    
+    try:
+        con.execute(f"CREATE VIEW v_fact AS SELECT * FROM read_parquet('{STAR}/fact_financials/*.parquet')")
+        con.execute(f"CREATE VIEW v_comp AS SELECT * FROM read_parquet('{STAR}/dim_company/*.parquet')")
+        con.execute(f"CREATE VIEW v_metr AS SELECT * FROM read_parquet('{STAR}/dim_metric/*.parquet')")
+        con.execute(f"CREATE VIEW v_cal  AS SELECT * FROM read_parquet('{STAR}/dim_calendar/*.parquet')")
+    except: return
+
+    # Base View: Fiscal Alignment
+    con.execute("""
+        CREATE TEMP TABLE base_financials AS
+        SELECT 
+            f.company_id, c.ticker, c.sector_id,
+            m.metric_name, m.report_section,
+            cl.date as report_date, 
+            COALESCE(f.fiscal_year, cl.cal_year) as fiscal_year,
+            COALESCE(f.fiscal_period, CAST(cl.cal_quarter AS VARCHAR)) as fiscal_period,
+            f.value
+        FROM v_fact f
+        JOIN v_comp c ON f.company_id = c.company_id
+        JOIN v_metr m ON f.metric_id = m.metric_id
+        JOIN v_cal cl ON f.calendar_id = cl.calendar_id
+    """)
+
+    # --- MART 1: QUARTERLY ---
+    atomic_write_parquet(con, "base_financials", MARTS / "mart_quarterly.parquet")
+
+    # --- MART 2: TTM ---
+    con.execute("""
+        CREATE OR REPLACE TABLE mart_ttm AS
+        WITH windowed AS (
+            SELECT 
+                *,
+                SUM(value) OVER (
+                    PARTITION BY company_id, metric_name 
+                    ORDER BY fiscal_year, fiscal_period 
+                    ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+                ) as sum_4q,
+                COUNT(*) OVER (
+                    PARTITION BY company_id, metric_name 
+                    ORDER BY fiscal_year, fiscal_period 
+                    ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+                ) as count_4q
+            FROM base_financials
+        )
+        SELECT 
+            company_id, ticker, metric_name, report_date, fiscal_year, fiscal_period,
+            CASE 
+                WHEN report_section = 'Balance Sheet' THEN value
+                WHEN count_4q < 4 THEN NULL -- Gap Protection
+                ELSE sum_4q 
+            END as value_ttm
+        FROM windowed
+    """)
+
+    atomic_write_parquet(con, "mart_ttm", MARTS / "mart_ttm.parquet")
+    status("Marts: TTM Built.")
+
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
+
+if __name__ == "__main__":
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print("===================================================")
+    print("   SMILE FUND: SEC DATA PIPELINE                   ")
+    print("===================================================")
+    
+    ensure_folders()
+    
+    # Optional API Sync
+    print("Select Mode:")
+    print("1. Full Update (API Sync + ETL) [Takes ~40 mins]")
+    print("2. ETL Only (Process Local Data) [Fast]")
+    choice = input("Enter 1 or 2: ")
+    
+    if choice == '1':
+        with Timer("API Sync"): update_from_api()
+
+    # ETL Pipeline
+    with Timer("Full ETL"):
+        with Timer("Staging"): build_staging()
+        with Timer("Dimensions"): build_dimensions()
+        with Timer("Facts"): build_facts()
+        with Timer("Marts"): build_marts()
+
+    print("\nPipeline Complete. Check logs/etl_errors.log for dropped records.")
