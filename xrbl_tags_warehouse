@@ -1,0 +1,105 @@
+xbrl_tag,canonical_metric,metric_id,report_section,weight
+# --- INCOME STATEMENT: REVENUE (Weight: 1) ---
+Revenues,Revenue,1001,Income Statement,1
+SalesRevenueNet,Revenue,1001,Income Statement,1
+SalesRevenueServicesNet,Revenue,1001,Income Statement,1
+SalesRevenueGoodsNet,Revenue,1001,Income Statement,1
+RevenueFromContractWithCustomerExcludingAssessedTax,Revenue,1001,Income Statement,1
+RevenueFromContractWithCustomerIncludingAssessedTax,Revenue,1001,Income Statement,1
+RegulatedAndUnregulatedOperatingRevenue,Revenue,1001,Income Statement,1
+OilAndGasRevenue,Revenue,1001,Income Statement,1
+FinancialServicesRevenue,Revenue,1001,Income Statement,1
+InterestAndDividendIncomeOperating,Interest Income (Bank),1101,Income Statement,1
+InterestIncomeOperating,Interest Income (Bank),1101,Income Statement,1
+NoninterestIncome,Non-Interest Income,1104,Income Statement,1
+OperatingLeaseRevenue,Rental Income,1107,Income Statement,1
+
+# --- INCOME STATEMENT: EXPENSES (Weight: -1) ---
+# We flip these to negative so (Rev + Exp = Profit)
+CostOfGoodsAndServicesSold,COGS,1002,Income Statement,-1
+CostOfRevenue,COGS,1002,Income Statement,-1
+CostOfServices,COGS,1002,Income Statement,-1
+CostOfGoodsSold,COGS,1002,Income Statement,-1
+OperatingExpenses,Operating Expenses,1004,Income Statement,-1
+ResearchAndDevelopmentExpense,R&D Expenses,1005,Income Statement,-1
+ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost,R&D Expenses,1005,Income Statement,-1
+SellingGeneralAndAdministrativeExpense,SG&A Expenses,1006,Income Statement,-1
+SellingAndMarketingExpense,Selling & Marketing,1006,Income Statement,-1
+GeneralAndAdministrativeExpense,General & Admin,1006,Income Statement,-1
+DepreciationAndAmortization,Depreciation & Amort,1015,Income Statement,-1
+InterestExpense,Interest Expense,1008,Income Statement,-1
+InterestExpenseOperating,Interest Expense (Bank),1102,Income Statement,-1
+ProvisionForLoanLeaseAndOtherLosses,Provision for Credit Losses,1106,Income Statement,-1
+NoninterestExpense,Non-Interest Expense,1105,Income Statement,-1
+IncomeTaxExpenseBenefit,Income Tax Expense,1020,Income Statement,-1
+
+# --- INCOME STATEMENT: CALCULATED/NET (Weight: 1) ---
+# These are "Result" lines, so we keep them as reported (usually positive or negative based on performance)
+GrossProfit,Gross Profit,1003,Income Statement,1
+OperatingIncomeLoss,Operating Income,1007,Income Statement,1
+NetIncomeLoss,Net Income,1009,Income Statement,1
+ProfitLoss,Net Income,1009,Income Statement,1
+NetInterestIncome,Net Interest Income,1103,Income Statement,1
+EarningsPerShareBasic,EPS Basic,1010,Income Statement,1
+EarningsPerShareDiluted,EPS Diluted,1011,Income Statement,1
+WeightedAverageNumberOfSharesOutstandingBasic,Shares Basic,1012,Income Statement,1
+WeightedAverageNumberOfSharesOutstandingDiluted,Shares Diluted,1013,Income Statement,1
+
+# --- BALANCE SHEET: ASSETS (Weight: 1) ---
+Assets,Total Assets,2001,Balance Sheet,1
+AssetsCurrent,Current Assets,2002,Balance Sheet,1
+CashAndCashEquivalentsAtCarryingValue,Cash & Equivalents,2003,Balance Sheet,1
+CashAndDueFromBanks,Cash & Equivalents,2003,Balance Sheet,1
+RestrictedCashAndCashEquivalents,Restricted Cash,2035,Balance Sheet,1
+InventoryNet,Inventory,2004,Balance Sheet,1
+AccountsReceivableNetCurrent,Accounts Receivable,2040,Balance Sheet,1
+PropertyPlantAndEquipmentNet,PP&E Net,2005,Balance Sheet,1
+Goodwill,Goodwill,2006,Balance Sheet,1
+IntangibleAssetsNetExcludingGoodwill,Intangible Assets,2007,Balance Sheet,1
+LoansAndLeasesReceivableNetReportedAmount,Net Loans (Bank),2030,Balance Sheet,1
+AvailableForSaleSecuritiesDebtSecurities,Investments (AFS),2050,Balance Sheet,1
+
+# --- BALANCE SHEET: LIABILITIES (Weight: 1) ---
+# Note: In standard accounting DBs, Liabilities are often negative (Credits). 
+# But for visual dashboards, users prefer seeing "Debt: $50M" not "Debt: -$50M".
+# We set weight to 1 here to keep them positive for display. 
+# If you want A = L + E to validate, you can handle that in Power BI DAX.
+Liabilities,Total Liabilities,2010,Balance Sheet,1
+LiabilitiesCurrent,Current Liabilities,2011,Balance Sheet,1
+AccountsPayableCurrent,Accounts Payable,2012,Balance Sheet,1
+LongTermDebt,Long Term Debt,2013,Balance Sheet,1
+LongTermDebtNoncurrent,Long Term Debt,2013,Balance Sheet,1
+ContractWithCustomerLiabilityCurrent,Deferred Revenue (Current),2014,Balance Sheet,1
+ContractWithCustomerLiabilityNoncurrent,Deferred Revenue (Non-Current),2015,Balance Sheet,1
+Deposits,Total Deposits,2031,Balance Sheet,1
+
+# --- BALANCE SHEET: EQUITY (Weight: 1) ---
+StockholdersEquity,Stockholders Equity,2020,Balance Sheet,1
+RetainedEarningsAccumulatedDeficit,Retained Earnings,2021,Balance Sheet,1
+CommonStockValue,Common Stock,2022,Balance Sheet,1
+AdditionalPaidInCapital,Additional Paid In Capital,2023,Balance Sheet,1
+TreasuryStockValue,Treasury Stock,2025,Balance Sheet,-1
+
+# --- CASH FLOW: OPERATING (Weight: 1 for Inflows, -1 for Outflows) ---
+# Net figures are usually 1
+NetCashProvidedByUsedInOperatingActivities,Operating Cash Flow,3001,Cash Flow,1
+
+# --- CASH FLOW: INVESTING (Weight: 1 for Inflows, -1 for Outflows) ---
+NetCashProvidedByUsedInInvestingActivities,Investing Cash Flow,3002,Cash Flow,1
+PaymentsToAcquirePropertyPlantAndEquipment,CapEx,3004,Cash Flow,-1
+PaymentsToAcquireBusinessesNetOfCashAcquired,Acquisitions,3010,Cash Flow,-1
+PaymentsToAcquireAvailableForSaleSecuritiesDebtSecurities,Purchase of Investments,3011,Cash Flow,-1
+ProceedsFromSaleOfAvailableForSaleSecuritiesDebtSecurities,Sale of Investments,3012,Cash Flow,1
+
+# --- CASH FLOW: FINANCING (Weight: 1 for Inflows, -1 for Outflows) ---
+NetCashProvidedByUsedInFinancingActivities,Financing Cash Flow,3003,Cash Flow,1
+PaymentsOfDividends,Dividends Paid,3005,Cash Flow,-1
+PaymentsOfDividendsCommonStock,Dividends Paid,3005,Cash Flow,-1
+PaymentsOfStockRepurchases,Stock Repurchases,3006,Cash Flow,-1
+StockRepurchasedDuringPeriodValue,Stock Repurchases,3006,Cash Flow,-1
+ProceedsFromIssuanceOfCommonStock,Stock Issuance,3020,Cash Flow,1
+ProceedsFromIssuanceOfLongTermDebt,Debt Issuance,3021,Cash Flow,1
+RepaymentsOfLongTermDebt,Debt Repayment,3022,Cash Flow,-1
+
+# --- META ---
+StockSplitRatio,Stock Split Ratio,9001,Meta,1
