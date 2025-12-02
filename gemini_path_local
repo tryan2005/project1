@@ -1,0 +1,222 @@
+"""
+SMILE Fund: Local Data Bootstrapper
+-----------------------------------
+This script initializes the warehouse using the bulk ZIP files downloaded 
+manually from the SEC website. It replaces the "API Sync" step for the 
+initial 10-year history load.
+
+Prerequisites:
+1. Download 'companyfacts.zip' and 'submissions.zip' from SEC.gov.
+2. Place them in C:/smilefund_project/data/sec/
+"""
+
+import os
+import json
+import zipfile
+import shutil
+import datetime
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from pathlib import Path
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+
+BASE = Path(r"C:\smilefund_project")
+ZIPS_DIR = BASE / "data" / "sec"
+RAW_FACTS_DIR = ZIPS_DIR / "raw" / "company_facts"
+RAW_SUBM_DIR = ZIPS_DIR / "raw" / "submissions"
+RAW_META_DIR = ZIPS_DIR / "raw" / "meta"
+STAGING_DIR = BASE / "warehouse" / "staging"
+LOGS_DIR = BASE / "warehouse" / "logs"
+CONFIG_DIR = BASE / "config"
+
+FILES = {
+    'facts_zip': ZIPS_DIR / "companyfacts.zip",
+    'subm_zip': ZIPS_DIR / "submissions.zip",
+    'tickers_json': ZIPS_DIR / "company_tickers.json",
+    'tag_map': CONFIG_DIR / "xbrl_tag_map.csv",
+    'out_parquet': STAGING_DIR / "_best_local.parquet"
+}
+
+# Same Unit Logic as Pipeline
+UNIT_SCALERS = {
+    'USD': 1.0, 'usd': 1.0, 'iso4217:USD': 1.0,
+    'USDThousands': 1000.0, 'usdthousands': 1000.0,
+    'USDMillions': 1000000.0, 'usdmillions': 1000000.0,
+    'USDBillions': 1000000000.0, 'usdbillions': 1000000000.0,
+    'shares': 1.0, 'sharesThousands': 1000.0, 
+    'sharesMillions': 1000000.0, 'sharesBillions': 1000000000.0,
+    'pure': 1.0
+}
+
+START_DATE = "2015-01-01"
+
+# ==============================================================================
+# 1. EXTRACTION UTILS
+# ==============================================================================
+
+def status(msg):
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+def ensure_folders():
+    for d in [RAW_FACTS_DIR, RAW_SUBM_DIR, RAW_META_DIR, STAGING_DIR, LOGS_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+
+def extract_zip(zip_path, target_dir):
+    """Extracts a large zip file with progress updates."""
+    if not zip_path.exists():
+        status(f"❌ Missing File: {zip_path}")
+        return False
+    
+    # Check if already extracted (simple check: is folder empty?)
+    if any(target_dir.iterdir()):
+        status(f"Skipping extraction for {zip_path.name} (Target not empty).")
+        return True
+
+    status(f"Extracting {zip_path.name} (This may take 5-10 minutes)...")
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            file_list = z.namelist()
+            total = len(file_list)
+            for i, file in enumerate(file_list):
+                z.extract(file, target_dir)
+                if i % 5000 == 0:
+                    print(f"  Extracted {i}/{total} files...", end='\r')
+        status(f"✔ Extraction complete: {zip_path.name}")
+        return True
+    except Exception as e:
+        status(f"❌ Error extracting {zip_path.name}: {e}")
+        return False
+
+def move_tickers():
+    """Moves the manually downloaded tickers file to the correct meta folder."""
+    target = RAW_META_DIR / "company_tickers.json"
+    if FILES['tickers_json'].exists() and not target.exists():
+        shutil.copy(FILES['tickers_json'], target)
+        status("✔ Moved company_tickers.json to raw/meta/")
+    elif not target.exists():
+        status("⚠️ Warning: company_tickers.json not found in data/sec/")
+
+# ==============================================================================
+# 2. LOCAL PARSING LOGIC (ZIP -> PARQUET)
+# ==============================================================================
+
+def build_staging_from_local():
+    """
+    Parses the extracted JSON files into the Staging Parquet file.
+    Equivalent to 'Phase 1' but optimized for bulk local processing.
+    """
+    if not FILES['tag_map'].exists():
+        status("❌ CRITICAL: config/xbrl_tag_map.csv is missing.")
+        return
+
+    # Load Config
+    tag_df = pd.read_csv(FILES['tag_map'])
+    valid_tags = set(tag_df['xbrl_tag'].unique())
+    tag_to_id = dict(zip(tag_df.xbrl_tag, tag_df.metric_id))
+    
+    schema = pa.schema([
+        ("cik", pa.int64()), ("tag", pa.string()), ("metric_id", pa.int32()),
+        ("val", pa.float64()), ("unit", pa.string()), 
+        ("fy", pa.int32()), ("fp", pa.string()), ("form", pa.string()), 
+        ("filed", pa.date32()), ("end", pa.date32()), ("frame", pa.string())
+    ])
+
+    writer = pq.ParquetWriter(FILES['out_parquet'], schema, compression="zstd")
+    rows_buffer = []
+    
+    # Iterate over extracted files
+    files = list(RAW_FACTS_DIR.glob("*.json"))
+    if not files:
+        status("❌ No JSON files found. Did extraction fail?")
+        return
+
+    status(f"Parsing {len(files)} local files...")
+    
+    count = 0
+    for fpath in files:
+        try:
+            with open(fpath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            cik = int(data.get('cik', 0))
+            facts = data.get('facts', {}).get('us-gaap', {})
+
+            for tag, content in facts.items():
+                if tag not in valid_tags: continue
+                
+                mid = tag_to_id.get(tag)
+
+                for unit_name, records in content.get('units', {}).items():
+                    # Scaling Logic
+                    scale_factor = 1.0
+                    for k, v in UNIT_SCALERS.items():
+                        if k in unit_name:
+                            scale_factor = v
+                            break
+                    
+                    for r in records:
+                        # Date & Value Logic
+                        try:
+                            filed_dt = pd.to_datetime(r.get('filed'), errors='coerce')
+                            end_dt = pd.to_datetime(r.get('end'), errors='coerce')
+                            if pd.isna(filed_dt) or pd.isna(end_dt): continue
+                            if str(end_dt.date()) < START_DATE: continue
+                            
+                            raw_val = float(r['val'])
+                            final_val = raw_val * scale_factor
+                            if abs(final_val) > 1e16: continue # Outlier
+                        except: continue
+
+                        rows_buffer.append({
+                            'cik': cik, 'tag': tag, 'metric_id': mid,
+                            'val': final_val, 'unit': unit_name,
+                            'fy': r.get('fy', 0), 'fp': r.get('fp', ''),
+                            'form': r.get('form', ''),
+                            'filed': filed_dt.date(),
+                            'end': end_dt.date(),
+                            'frame': r.get('frame', None)
+                        })
+        except: pass # Skip bad files
+
+        count += 1
+        if len(rows_buffer) > 200_000:
+            writer.write_table(pa.Table.from_pylist(rows_buffer, schema=schema))
+            rows_buffer = []
+            print(f"  Parsed {count}/{len(files)} files...", end='\r')
+
+    if rows_buffer:
+        writer.write_table(pa.Table.from_pylist(rows_buffer, schema=schema))
+    
+    writer.close()
+    status("\n✔ Local Staging Complete: _best_local.parquet created.")
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+
+if __name__ == "__main__":
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print("===================================================")
+    print("   SMILE FUND: LOCAL DATA BOOTSTRAPPER             ")
+    print("===================================================")
+    
+    ensure_folders()
+    
+    # Step 1: Extract Zips
+    if extract_zip(FILES['facts_zip'], RAW_FACTS_DIR):
+        extract_zip(FILES['subm_zip'], RAW_SUBM_DIR)
+        move_tickers()
+        
+        # Step 2: Parse
+        build_staging_from_local()
+        
+        print("\n---------------------------------------------------")
+        print("BOOTSTRAP COMPLETE.")
+        print("Now run: python etl_pipeline.py --etl-only")
+        print("---------------------------------------------------")
+    else:
+        print("\nSetup failed. Please check your zip files.")
